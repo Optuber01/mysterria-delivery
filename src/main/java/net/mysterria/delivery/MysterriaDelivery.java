@@ -4,6 +4,7 @@ import dev.ua.ikeepcalm.catwalk.hub.webserver.services.CatWalkWebserverService;
 import lombok.Getter;
 import net.luckperms.api.LuckPerms;
 import net.mysterria.delivery.api.*;
+import net.mysterria.delivery.audit.DeliveryAuditEmitter;
 import net.mysterria.delivery.command.DeliveryCommand;
 import net.mysterria.delivery.config.DeliveryConfig;
 import net.mysterria.delivery.listener.PlayerJoinListener;
@@ -25,6 +26,7 @@ public class MysterriaDelivery extends JavaPlugin {
     private QueueManager queueManager;
     private TranslationManager translationManager;
     private LuckPerms luckPerms;
+    private DeliveryAuditEmitter auditEmitter;
 
     @Override
     public void onEnable() {
@@ -42,7 +44,8 @@ public class MysterriaDelivery extends JavaPlugin {
 
         deliveryConfig = new DeliveryConfig(this);
         translationManager = new TranslationManager(this);
-        queueManager = new QueueManager(this);
+        auditEmitter = new DeliveryAuditEmitter(this);
+        queueManager = new QueueManager(this, auditEmitter);
         deliveryManager = new DeliveryManager(this, deliveryConfig, queueManager);
 
         getCommand("delivery").setExecutor(new DeliveryCommand(this));

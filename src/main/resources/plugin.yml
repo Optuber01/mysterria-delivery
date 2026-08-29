@@ -5,7 +5,8 @@ api-version: '1.21'
 authors: [ Mysterria ]
 description: "Automated delivery system for Mysterria purchases"
 website: "https://mysterria.net"
-depend: [ CatWalk, LuckPerms ]
+depend: [ CatWalk, LuckPerms, CircleOfImagination ]
+softdepend: [ MysterriaLogging ]
 commands:
   delivery:
     description: "MysterriaDelivery management commands"

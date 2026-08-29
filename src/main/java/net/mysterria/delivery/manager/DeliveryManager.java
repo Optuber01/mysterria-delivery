@@ -1,11 +1,14 @@
 package net.mysterria.delivery.manager;
 
+import dev.ua.ikeepcalm.coi.api.audit.AuditOutcome;
+import dev.ua.ikeepcalm.coi.api.audit.AuditRisk;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.minimessage.MiniMessage;
 import net.luckperms.api.node.Node;
 import net.luckperms.api.node.types.InheritanceNode;
 import net.luckperms.api.node.types.PermissionNode;
 import net.mysterria.delivery.MysterriaDelivery;
+import net.mysterria.delivery.audit.DeliveryAuditEmitter;
 import net.mysterria.delivery.config.DeliveryConfig;
 import net.mysterria.delivery.model.DeliveryResponse;
 import net.mysterria.delivery.model.PurchaseRequest;
@@ -19,20 +22,23 @@ import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Level;
 
 public class DeliveryManager {
 
     private final MysterriaDelivery plugin;
     private final QueueManager queueManager;
-    private final Set<String> processedPurchases = new HashSet<>();
+    private final Set<String> processedPurchases = ConcurrentHashMap.newKeySet();
     private final MiniMessage miniMessage = MiniMessage.miniMessage();
     private DeliveryConfig config;
+    private final DeliveryAuditEmitter auditEmitter;
 
     public DeliveryManager(MysterriaDelivery plugin, DeliveryConfig config, QueueManager queueManager) {
         this.plugin = plugin;
         this.config = config;
         this.queueManager = queueManager;
+        this.auditEmitter = plugin.getAuditEmitter();
     }
 
     public void reload(DeliveryConfig newConfig) {
@@ -40,11 +46,24 @@ public class DeliveryManager {
     }
 
     public CompletableFuture<DeliveryResponse> processPurchase(VoteReward request) {
+        emitReceived(request);
+        if (processedPurchases.contains(request.getPurchaseId())) {
+            auditEmitter.emit("duplicate-rejected", AuditOutcome.DENIED, AuditRisk.NORMAL,
+                    request.getPurchaseId(), safeUuid(request.getMinecraftUUID()),
+                    Map.of("delivery_kind", "vote_reward", "state", "already_delivered"));
+            return CompletableFuture.completedFuture(
+                    DeliveryResponse.success(request.getPurchaseId(), "Purchase already processed")
+            );
+        }
         UUID playerUuid = UUID.fromString(request.getMinecraftUUID());
         Player player = Bukkit.getPlayer(playerUuid);
 
         if (player == null || !player.isOnline()) {
-            queueManager.queueDelivery(request);
+            if (!queueManager.queueDelivery(request)) {
+                return CompletableFuture.completedFuture(
+                        DeliveryResponse.success(request.getPurchaseId(), "Purchase already queued")
+                );
+            }
             return CompletableFuture.completedFuture(
                     DeliveryResponse.queued(request.getPurchaseId(), "Player offline, delivery queued")
             );
@@ -58,7 +77,9 @@ public class DeliveryManager {
      * Requires player to be online, queues if offline
      */
     public CompletableFuture<DeliveryResponse> processItemDelivery(PurchaseRequest request) {
+        emitReceived(request);
         if (processedPurchases.contains(request.getPurchaseId())) {
+            emitDuplicate(request, "already_delivered");
             return CompletableFuture.completedFuture(
                     DeliveryResponse.success(request.getPurchaseId(), "Purchase already processed")
             );
@@ -68,7 +89,11 @@ public class DeliveryManager {
         Player player = Bukkit.getPlayer(playerUuid);
 
         if (player == null || !player.isOnline()) {
-            queueManager.queueDelivery(request);
+            if (!queueManager.queueDelivery(request)) {
+                return CompletableFuture.completedFuture(
+                        DeliveryResponse.success(request.getPurchaseId(), "Purchase already queued")
+                );
+            }
             return CompletableFuture.completedFuture(
                     DeliveryResponse.queued(request.getPurchaseId(), "Player offline, delivery queued")
             );
@@ -81,7 +106,9 @@ public class DeliveryManager {
      * Process subscription delivery (LuckPerms groups)
      */
     public CompletableFuture<DeliveryResponse> processSubscriptionDelivery(PurchaseRequest request) {
+        emitReceived(request);
         if (processedPurchases.contains(request.getPurchaseId())) {
+            emitDuplicate(request, "already_delivered");
             return CompletableFuture.completedFuture(
                     DeliveryResponse.success(request.getPurchaseId(), "Purchase already processed")
             );
@@ -95,7 +122,9 @@ public class DeliveryManager {
      * Process permission delivery (LuckPerms permissions)
      */
     public CompletableFuture<DeliveryResponse> processPermissionDelivery(PurchaseRequest request) {
+        emitReceived(request);
         if (processedPurchases.contains(request.getPurchaseId())) {
+            emitDuplicate(request, "already_delivered");
             return CompletableFuture.completedFuture(
                     DeliveryResponse.success(request.getPurchaseId(), "Purchase already processed")
             );
@@ -106,44 +135,62 @@ public class DeliveryManager {
     }
 
     private CompletableFuture<DeliveryResponse> deliverVoteReward(Player player, VoteReward request) {
-        return CompletableFuture.supplyAsync(() -> {
-            try {
-                String command = request.getCommand();
+        CompletableFuture<DeliveryResponse> result = new CompletableFuture<>();
+        String command = request.getCommand();
+        if (command == null || command.isEmpty()) {
+            plugin.getLogger().warning("No commands found in metadata for vote reward: " + request.getPurchaseId());
+            emitFailed(request.getPurchaseId(), safeUuid(request.getMinecraftUUID()), "no_delivery_commands", "vote_reward");
+            return CompletableFuture.completedFuture(
+                    DeliveryResponse.error(request.getPurchaseId(), "No delivery commands configured"));
+        }
 
-                if (command.isEmpty()) {
-                    plugin.getLogger().warning("No commands found in metadata for vote reward: " + request.getPurchaseId());
-                    return DeliveryResponse.error(request.getPurchaseId(), "No delivery commands configured");
-                }
-
-                Bukkit.getScheduler().runTask(plugin, () -> {
+        try {
+            Bukkit.getScheduler().runTask(plugin, () -> {
+                try {
                     plugin.getLogger().info("Executing command: " + command);
                     Bukkit.dispatchCommand(Bukkit.getConsoleSender(), command);
-                    announceDelivery(player, request);
-                });
-
-                processedPurchases.add(request.getPurchaseId());
-                return DeliveryResponse.success(request.getPurchaseId(), "Item delivered successfully");
-
-            } catch (Exception e) {
-                plugin.getLogger().log(Level.SEVERE, "Failed to deliver item", e);
-                return DeliveryResponse.error(request.getPurchaseId(), "Delivery failed: " + e.getMessage());
-            }
-        });
+                    processedPurchases.add(request.getPurchaseId());
+                    emitDelivered(request.getPurchaseId(), player.getUniqueId(), "vote_reward");
+                    announceVoteDelivery(player, request);
+                    result.complete(DeliveryResponse.success(request.getPurchaseId(), "Item delivered successfully"));
+                } catch (RuntimeException failure) {
+                    emitFailed(request.getPurchaseId(), player.getUniqueId(), "command_execution_failed", "vote_reward");
+                    plugin.getLogger().log(Level.SEVERE, "Failed to execute vote reward command", failure);
+                    result.complete(DeliveryResponse.error(request.getPurchaseId(),
+                            "Delivery failed: " + failure.getMessage()));
+                }
+            });
+        } catch (RuntimeException failure) {
+            emitFailed(request.getPurchaseId(), player.getUniqueId(), "scheduling_failed", "vote_reward");
+            plugin.getLogger().log(Level.SEVERE, "Failed to schedule vote reward delivery", failure);
+            result.complete(DeliveryResponse.error(request.getPurchaseId(),
+                    "Delivery failed: " + failure.getMessage()));
+        }
+        return result;
     }
 
     private CompletableFuture<DeliveryResponse> deliverItem(Player player, PurchaseRequest request) {
-        return CompletableFuture.supplyAsync(() -> {
-            try {
-                List<String> commands = extractCommands(request.getMetadata());
+        CompletableFuture<DeliveryResponse> result = new CompletableFuture<>();
+        List<String> commands;
+        try {
+            commands = extractCommands(request.getMetadata());
+        } catch (RuntimeException failure) {
+            emitFailed(request.getPurchaseId(), player.getUniqueId(), "invalid_delivery_metadata", "purchase");
+            return CompletableFuture.completedFuture(
+                    DeliveryResponse.error(request.getPurchaseId(), "Delivery failed: " + failure.getMessage()));
+        }
 
-                if (commands.isEmpty()) {
-                    plugin.getLogger().warning("No commands found in metadata for purchase: " + request.getPurchaseId());
-                    return DeliveryResponse.error(request.getPurchaseId(), "No delivery commands configured");
-                }
+        if (commands.isEmpty()) {
+            plugin.getLogger().warning("No commands found in metadata for purchase: " + request.getPurchaseId());
+            emitFailed(request.getPurchaseId(), safeUuid(request.getMinecraftUuid()), "no_delivery_commands", "purchase");
+            return CompletableFuture.completedFuture(
+                    DeliveryResponse.error(request.getPurchaseId(), "No delivery commands configured"));
+        }
 
-                int quantity = request.getQuantity() != null ? request.getQuantity() : 1;
-
-                Bukkit.getScheduler().runTask(plugin, () -> {
+        int quantity = request.getQuantity() != null ? request.getQuantity() : 1;
+        try {
+            Bukkit.getScheduler().runTask(plugin, () -> {
+                try {
                     for (String commandTemplate : commands) {
                         String command = commandTemplate
                                 .replace("{player}", player.getName())
@@ -159,17 +206,26 @@ public class DeliveryManager {
                         Bukkit.dispatchCommand(Bukkit.getConsoleSender(), command);
                     }
 
-                    announceDelivery(player, request);
-                });
-
-                processedPurchases.add(request.getPurchaseId());
-                return DeliveryResponse.success(request.getPurchaseId(), "Item delivered successfully");
-
-            } catch (Exception e) {
-                plugin.getLogger().log(Level.SEVERE, "Failed to deliver item", e);
-                return DeliveryResponse.error(request.getPurchaseId(), "Delivery failed: " + e.getMessage());
-            }
-        });
+                    processedPurchases.add(request.getPurchaseId());
+                    if (!isDiscordRole(request)) {
+                        emitDelivered(request.getPurchaseId(), player.getUniqueId(), "purchase");
+                    }
+                    announcePurchaseDelivery(player, request);
+                    result.complete(DeliveryResponse.success(request.getPurchaseId(), "Item delivered successfully"));
+                } catch (RuntimeException failure) {
+                    emitFailed(request.getPurchaseId(), player.getUniqueId(), "command_execution_failed", "purchase");
+                    plugin.getLogger().log(Level.SEVERE, "Failed to execute item delivery commands", failure);
+                    result.complete(DeliveryResponse.error(request.getPurchaseId(),
+                            "Delivery failed: " + failure.getMessage()));
+                }
+            });
+        } catch (RuntimeException failure) {
+            emitFailed(request.getPurchaseId(), player.getUniqueId(), "scheduling_failed", "purchase");
+            plugin.getLogger().log(Level.SEVERE, "Failed to schedule item delivery", failure);
+            result.complete(DeliveryResponse.error(request.getPurchaseId(),
+                    "Delivery failed: " + failure.getMessage()));
+        }
+        return result;
     }
 
     private CompletableFuture<DeliveryResponse> deliverSubscription(UUID playerUuid, PurchaseRequest request) {
@@ -177,6 +233,7 @@ public class DeliveryManager {
             try {
                 String groupName = extractGroupName(request.getMetadata());
                 if (groupName == null) {
+                    emitFailed(request.getPurchaseId(), playerUuid, "missing_group", "subscription");
                     return DeliveryResponse.error(request.getPurchaseId(), "No group specified in metadata");
                 }
 
@@ -195,11 +252,13 @@ public class DeliveryManager {
                 }
 
                 processedPurchases.add(request.getPurchaseId());
+                emitDelivered(request.getPurchaseId(), playerUuid, "subscription");
                 plugin.getLogger().info("Granted subscription " + groupName + " to " + playerUuid + " for " + duration);
 
                 return DeliveryResponse.success(request.getPurchaseId(), "Subscription granted successfully");
 
             } catch (Exception e) {
+                emitFailed(request.getPurchaseId(), playerUuid, "delivery_exception", "subscription");
                 plugin.getLogger().log(Level.SEVERE, "Failed to deliver subscription", e);
                 return DeliveryResponse.error(request.getPurchaseId(), "Subscription delivery failed: " + e.getMessage());
             }
@@ -211,6 +270,7 @@ public class DeliveryManager {
             try {
                 List<String> permissions = extractPermissions(request.getMetadata());
                 if (permissions.isEmpty()) {
+                    emitFailed(request.getPurchaseId(), playerUuid, "missing_permissions", "permission");
                     return DeliveryResponse.error(request.getPurchaseId(), "No permissions specified in metadata");
                 }
 
@@ -232,11 +292,13 @@ public class DeliveryManager {
                 }
 
                 processedPurchases.add(request.getPurchaseId());
+                emitDelivered(request.getPurchaseId(), playerUuid, "permission");
                 plugin.getLogger().info("Granted permissions " + permissions + " to " + playerUuid + " for " + duration);
 
                 return DeliveryResponse.success(request.getPurchaseId(), "Permissions granted successfully");
 
             } catch (Exception e) {
+                emitFailed(request.getPurchaseId(), playerUuid, "delivery_exception", "permission");
                 plugin.getLogger().log(Level.SEVERE, "Failed to deliver permissions", e);
                 return DeliveryResponse.error(request.getPurchaseId(), "Permission delivery failed: " + e.getMessage());
             }
@@ -256,6 +318,22 @@ public class DeliveryManager {
 
             return DeliveryResponse.success(request.getPurchaseId(), "Discord role logged successfully");
         });
+    }
+
+    private void announceVoteDelivery(Player player, VoteReward request) {
+        try {
+            announceDelivery(player, request);
+        } catch (RuntimeException failure) {
+            plugin.getLogger().log(Level.WARNING, "Vote reward delivered, but its announcement failed", failure);
+        }
+    }
+
+    private void announcePurchaseDelivery(Player player, PurchaseRequest request) {
+        try {
+            announceDelivery(player, request);
+        } catch (RuntimeException failure) {
+            plugin.getLogger().log(Level.WARNING, "Purchase delivered, but its announcement failed", failure);
+        }
     }
 
     private void announceDelivery(Player purchaser, VoteReward request) {
@@ -335,6 +413,9 @@ public class DeliveryManager {
             if (queued.getPurchaseRequest() != null) {
                 deliverItem(player, queued.getPurchaseRequest()).thenAccept(response -> {
                     if (response.isSuccess()) {
+                        if (queued.getRetryCount() > 0 && !isDiscordRole(queued.getPurchaseRequest())) {
+                            emitRecovered(queued.getPurchaseRequest(), player.getUniqueId(), queued.getRetryCount(), "purchase");
+                        }
                         queueManager.removeFromQueue(queued.getPurchaseId());
                     } else {
                         queued.setRetryCount(queued.getRetryCount() + 1);
@@ -347,6 +428,9 @@ public class DeliveryManager {
             } else if (queued.getVoteReward() != null) {
                 deliverVoteReward(player, queued.getVoteReward()).thenAccept(response -> {
                     if (response.isSuccess()) {
+                        if (queued.getRetryCount() > 0) {
+                            emitRecovered(queued.getVoteReward(), player.getUniqueId(), queued.getRetryCount(), "vote_reward");
+                        }
                         queueManager.removeFromQueue(queued.getPurchaseId());
                     } else {
                         queued.setRetryCount(queued.getRetryCount() + 1);
@@ -402,5 +486,67 @@ public class DeliveryManager {
         }
 
         return Duration.ofDays(30);
+    }
+
+    private void emitReceived(PurchaseRequest request) {
+        if (request == null) return;
+        UUID playerId = safeUuid(request.getMinecraftUuid());
+        String serviceName = request.getServiceName() == null ? "" : request.getServiceName();
+        auditEmitter.emit("received", AuditOutcome.ATTEMPTED, AuditRisk.NORMAL,
+                request.getPurchaseId(), playerId,
+                Map.of("delivery_kind", "purchase", "service_name", serviceName));
+        if (isDiscordRole(request)) {
+            auditEmitter.emit("discord-role-requested", AuditOutcome.ATTEMPTED, AuditRisk.NORMAL,
+                    request.getPurchaseId(), playerId,
+                    Map.of("delivery_kind", "discord_role", "service_name", serviceName));
+        }
+    }
+
+    private void emitReceived(VoteReward request) {
+        if (request == null) return;
+        auditEmitter.emit("received", AuditOutcome.ATTEMPTED, AuditRisk.NORMAL,
+                request.getPurchaseId(), safeUuid(request.getMinecraftUUID()),
+                Map.of("delivery_kind", "vote_reward", "source",
+                        request.getSource() == null ? "" : request.getSource()));
+    }
+
+    private void emitDuplicate(PurchaseRequest request, String state) {
+        auditEmitter.emit("duplicate-rejected", AuditOutcome.DENIED, AuditRisk.NORMAL,
+                request.getPurchaseId(), safeUuid(request.getMinecraftUuid()),
+                Map.of("delivery_kind", "purchase", "state", state));
+    }
+
+    private void emitDelivered(String purchaseId, UUID playerId, String deliveryKind) {
+        auditEmitter.emit("delivered", AuditOutcome.COMMITTED, AuditRisk.NORMAL, purchaseId, playerId,
+                Map.of("delivery_kind", deliveryKind, "state", "delivered"));
+    }
+
+    private void emitFailed(String purchaseId, UUID playerId, String reason, String deliveryKind) {
+        auditEmitter.emit("failed", AuditOutcome.FAILED, AuditRisk.HIGH, purchaseId, playerId,
+                Map.of("delivery_kind", deliveryKind, "reason", reason, "state", "failed"));
+    }
+
+    private void emitRecovered(PurchaseRequest request, UUID playerId, int retries, String deliveryKind) {
+        auditEmitter.emit("recovered", AuditOutcome.COMMITTED, AuditRisk.NORMAL, request.getPurchaseId(), playerId,
+                Map.of("delivery_kind", deliveryKind, "retry_count", retries, "state", "recovered"));
+    }
+
+    private void emitRecovered(VoteReward request, UUID playerId, int retries, String deliveryKind) {
+        auditEmitter.emit("recovered", AuditOutcome.COMMITTED, AuditRisk.NORMAL, request.getPurchaseId(), playerId,
+                Map.of("delivery_kind", deliveryKind, "retry_count", retries, "state", "recovered"));
+    }
+
+    private boolean isDiscordRole(PurchaseRequest request) {
+        return "discord roles".equalsIgnoreCase(request.getServiceCategory())
+                || "discord_role".equalsIgnoreCase(request.getServiceCategory());
+    }
+
+    private UUID safeUuid(String value) {
+        if (value == null || value.isBlank()) return null;
+        try {
+            return UUID.fromString(value);
+        } catch (IllegalArgumentException ignored) {
+            return null;
+        }
     }
 }

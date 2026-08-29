@@ -13,6 +13,7 @@ repositories {
         url = "https://repo.papermc.io/repository/maven-public/"
     }
     maven { url 'https://jitpack.io' }
+    maven { url 'https://nexus.mysterria.net/repository/plugin-public/' }
 }
 
 dependencies {
@@ -21,10 +22,16 @@ dependencies {
     compileOnly("io.javalin.community.openapi:javalin-openapi-plugin:6.6.0")
     compileOnly("io.javalin.community.openapi:javalin-swagger-plugin:6.6.0")
     compileOnly("com.github.ikeepcalm:catwalk:v.0.8")
-    compileOnly 'org.projectlombok:lombok:1.18.36'
+    def coiApiJar = project.findProperty('coiApiJar')
+    if (coiApiJar) {
+        compileOnly files(coiApiJar)
+    } else {
+        compileOnly 'dev.ua.ikeepcalm:circle-of-imagination-api:1.4.8-SNAPSHOT'
+    }
+    compileOnly 'org.projectlombok:lombok:1.18.44'
     compileOnly 'net.luckperms:api:5.4'
     annotationProcessor("io.javalin.community.openapi:openapi-annotation-processor:6.6.0")
-    annotationProcessor 'org.projectlombok:lombok:1.18.36'
+    annotationProcessor 'org.projectlombok:lombok:1.18.44'
     compileOnly("io.papermc.paper:paper-api:1.21.8-R0.1-SNAPSHOT")
     implementation 'org.yaml:snakeyaml:2.2'
     implementation 'com.google.code.gson:gson:2.10.1'

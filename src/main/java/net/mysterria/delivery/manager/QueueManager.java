@@ -6,7 +6,10 @@ import com.google.gson.TypeAdapter;
 import com.google.gson.reflect.TypeToken;
 import com.google.gson.stream.JsonReader;
 import com.google.gson.stream.JsonWriter;
+import dev.ua.ikeepcalm.coi.api.audit.AuditOutcome;
+import dev.ua.ikeepcalm.coi.api.audit.AuditRisk;
 import net.mysterria.delivery.MysterriaDelivery;
+import net.mysterria.delivery.audit.DeliveryAuditEmitter;
 import net.mysterria.delivery.model.PurchaseRequest;
 import net.mysterria.delivery.model.QueuedDelivery;
 import net.mysterria.delivery.model.VoteReward;
@@ -51,13 +54,15 @@ public class QueueManager {
             })
             .create();
     private final File queueFile;
+    private final DeliveryAuditEmitter auditEmitter;
 
-    public QueueManager(MysterriaDelivery plugin) {
+    public QueueManager(MysterriaDelivery plugin, DeliveryAuditEmitter auditEmitter) {
         this.plugin = plugin;
+        this.auditEmitter = auditEmitter;
         this.queueFile = new File(plugin.getDataFolder(), "queue.json");
     }
 
-    public void queueDelivery(VoteReward request) {
+    public boolean queueDelivery(VoteReward request) {
         UUID playerUuid = UUID.fromString(request.getMinecraftUUID());
 
         QueuedDelivery queued = QueuedDelivery.builder()
@@ -69,13 +74,23 @@ public class QueueManager {
                 .retryCount(0)
                 .build();
 
-        queue.put(request.getPurchaseId(), queued);
+        if (queue.putIfAbsent(request.getPurchaseId(), queued) != null) {
+            auditEmitter.emit("duplicate-rejected", AuditOutcome.DENIED, AuditRisk.NORMAL,
+                    request.getPurchaseId(), playerUuid,
+                    Map.of("delivery_kind", "vote_reward", "state", "already_queued"));
+            return false;
+        }
         saveQueue();
 
+        auditEmitter.emit("queued", AuditOutcome.COMMITTED, AuditRisk.NORMAL,
+                request.getPurchaseId(), playerUuid,
+                Map.of("delivery_kind", "vote_reward", "state", "queued"));
+
         plugin.getLogger().info("Queued delivery for offline player: " + request.getPlayer());
+        return true;
     }
 
-    public void queueDelivery(PurchaseRequest request) {
+    public boolean queueDelivery(PurchaseRequest request) {
         UUID playerUuid = UUID.fromString(request.getMinecraftUuid());
 
         QueuedDelivery queued = QueuedDelivery.builder()
@@ -87,10 +102,24 @@ public class QueueManager {
                 .retryCount(0)
                 .build();
 
-        queue.put(request.getPurchaseId(), queued);
+        if (queue.putIfAbsent(request.getPurchaseId(), queued) != null) {
+            auditEmitter.emit("duplicate-rejected", AuditOutcome.DENIED, AuditRisk.NORMAL,
+                    request.getPurchaseId(), playerUuid,
+                    Map.of("delivery_kind", "purchase", "service_name",
+                            request.getServiceName() == null ? "" : request.getServiceName(),
+                            "state", "already_queued"));
+            return false;
+        }
         saveQueue();
 
+        auditEmitter.emit("queued", AuditOutcome.COMMITTED, AuditRisk.NORMAL,
+                request.getPurchaseId(), playerUuid,
+                Map.of("delivery_kind", "purchase", "service_name",
+                        request.getServiceName() == null ? "" : request.getServiceName(),
+                        "state", "queued"));
+
         plugin.getLogger().info("Queued delivery for offline player: " + request.getNickname());
+        return true;
     }
 
     public List<QueuedDelivery> getPlayerQueue(UUID playerUuid) {
