@@ -16,9 +16,13 @@ import net.mysterria.delivery.model.VoteReward;
 
 import java.io.File;
 import java.io.FileReader;
-import java.io.FileWriter;
 import java.io.IOException;
+import java.io.Writer;
 import java.lang.reflect.Type;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
 import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
@@ -28,8 +32,15 @@ import java.util.logging.Level;
 
 public class QueueManager {
 
+    public enum QueueResult {
+        QUEUED,
+        ALREADY_QUEUED,
+        PERSISTENCE_FAILED
+    }
+
     private final MysterriaDelivery plugin;
     private final Map<String, QueuedDelivery> queue = new ConcurrentHashMap<>();
+    private final Object persistenceLock = new Object();
     private final Gson gson = new GsonBuilder()
             .setPrettyPrinting()
             .registerTypeAdapter(LocalDateTime.class, new TypeAdapter<LocalDateTime>() {
@@ -62,7 +73,7 @@ public class QueueManager {
         this.queueFile = new File(plugin.getDataFolder(), "queue.json");
     }
 
-    public boolean queueDelivery(VoteReward request) {
+    public QueueResult queueDelivery(VoteReward request) {
         UUID playerUuid = UUID.fromString(request.getMinecraftUUID());
 
         QueuedDelivery queued = QueuedDelivery.builder()
@@ -74,23 +85,29 @@ public class QueueManager {
                 .retryCount(0)
                 .build();
 
-        if (queue.putIfAbsent(request.getPurchaseId(), queued) != null) {
-            auditEmitter.emit("duplicate-rejected", AuditOutcome.DENIED, AuditRisk.NORMAL,
-                    request.getPurchaseId(), playerUuid,
-                    Map.of("delivery_kind", "vote_reward", "state", "already_queued"));
-            return false;
+        synchronized (persistenceLock) {
+            if (queue.putIfAbsent(request.getPurchaseId(), queued) != null) {
+                auditEmitter.emit("duplicate-rejected", AuditOutcome.DENIED, AuditRisk.NORMAL,
+                        request.getPurchaseId(), playerUuid,
+                        Map.of("delivery_kind", "vote_reward", "state", "already_queued"));
+                return QueueResult.ALREADY_QUEUED;
+            }
+            if (!saveQueueLocked()) {
+                queue.remove(request.getPurchaseId(), queued);
+                emitPersistenceFailure(request.getPurchaseId(), playerUuid, "vote_reward");
+                return QueueResult.PERSISTENCE_FAILED;
+            }
         }
-        saveQueue();
 
         auditEmitter.emit("queued", AuditOutcome.COMMITTED, AuditRisk.NORMAL,
                 request.getPurchaseId(), playerUuid,
                 Map.of("delivery_kind", "vote_reward", "state", "queued"));
 
         plugin.getLogger().info("Queued delivery for offline player: " + request.getPlayer());
-        return true;
+        return QueueResult.QUEUED;
     }
 
-    public boolean queueDelivery(PurchaseRequest request) {
+    public QueueResult queueDelivery(PurchaseRequest request) {
         UUID playerUuid = UUID.fromString(request.getMinecraftUuid());
 
         QueuedDelivery queued = QueuedDelivery.builder()
@@ -102,15 +119,21 @@ public class QueueManager {
                 .retryCount(0)
                 .build();
 
-        if (queue.putIfAbsent(request.getPurchaseId(), queued) != null) {
-            auditEmitter.emit("duplicate-rejected", AuditOutcome.DENIED, AuditRisk.NORMAL,
-                    request.getPurchaseId(), playerUuid,
-                    Map.of("delivery_kind", "purchase", "service_name",
-                            request.getServiceName() == null ? "" : request.getServiceName(),
-                            "state", "already_queued"));
-            return false;
+        synchronized (persistenceLock) {
+            if (queue.putIfAbsent(request.getPurchaseId(), queued) != null) {
+                auditEmitter.emit("duplicate-rejected", AuditOutcome.DENIED, AuditRisk.NORMAL,
+                        request.getPurchaseId(), playerUuid,
+                        Map.of("delivery_kind", "purchase", "service_name",
+                                request.getServiceName() == null ? "" : request.getServiceName(),
+                                "state", "already_queued"));
+                return QueueResult.ALREADY_QUEUED;
+            }
+            if (!saveQueueLocked()) {
+                queue.remove(request.getPurchaseId(), queued);
+                emitPersistenceFailure(request.getPurchaseId(), playerUuid, "purchase");
+                return QueueResult.PERSISTENCE_FAILED;
+            }
         }
-        saveQueue();
 
         auditEmitter.emit("queued", AuditOutcome.COMMITTED, AuditRisk.NORMAL,
                 request.getPurchaseId(), playerUuid,
@@ -119,7 +142,7 @@ public class QueueManager {
                         "state", "queued"));
 
         plugin.getLogger().info("Queued delivery for offline player: " + request.getNickname());
-        return true;
+        return QueueResult.QUEUED;
     }
 
     public List<QueuedDelivery> getPlayerQueue(UUID playerUuid) {
@@ -128,38 +151,80 @@ public class QueueManager {
                 .toList();
     }
 
-    public void removeFromQueue(String purchaseId) {
-        queue.remove(purchaseId);
-        saveQueue();
+    public boolean removeFromQueue(String purchaseId) {
+        synchronized (persistenceLock) {
+            QueuedDelivery removed = queue.remove(purchaseId);
+            if (removed == null) {
+                return true;
+            }
+            if (saveQueueLocked()) {
+                return true;
+            }
+            queue.putIfAbsent(purchaseId, removed);
+            return false;
+        }
     }
 
-    public void saveQueue() {
-        try (FileWriter writer = new FileWriter(queueFile)) {
-            gson.toJson(queue.values(), writer);
+    public boolean saveQueue() {
+        synchronized (persistenceLock) {
+            return saveQueueLocked();
+        }
+    }
+
+    private boolean saveQueueLocked() {
+        File temporaryFile = new File(queueFile.getParentFile(), queueFile.getName() + ".tmp");
+        try {
+            Files.createDirectories(queueFile.getParentFile().toPath());
+            try (Writer writer = Files.newBufferedWriter(temporaryFile.toPath(), StandardCharsets.UTF_8)) {
+                gson.toJson(queue.values(), writer);
+            }
+            try {
+                Files.move(temporaryFile.toPath(), queueFile.toPath(),
+                        StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            } catch (AtomicMoveNotSupportedException ignored) {
+                Files.move(temporaryFile.toPath(), queueFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            }
+            return true;
         } catch (IOException e) {
             plugin.getLogger().log(Level.SEVERE, "Failed to save queue", e);
+            try {
+                Files.deleteIfExists(temporaryFile.toPath());
+            } catch (IOException cleanupFailure) {
+                plugin.getLogger().log(Level.FINE, "Failed to clean up temporary queue file", cleanupFailure);
+            }
+            return false;
         }
     }
 
     public void loadQueue() {
-        if (!queueFile.exists()) {
-            return;
-        }
-
-        try (FileReader reader = new FileReader(queueFile)) {
-            Type type = new TypeToken<List<QueuedDelivery>>() {
-            }.getType();
-            List<QueuedDelivery> loaded = gson.fromJson(reader, type);
-
-            if (loaded != null) {
-                queue.clear();
-                for (QueuedDelivery queued : loaded) {
-                    queue.put(queued.getPurchaseId(), queued);
-                }
-                plugin.getLogger().info("Loaded " + queue.size() + " queued deliveries");
+        synchronized (persistenceLock) {
+            if (!queueFile.exists()) {
+                return;
             }
-        } catch (IOException e) {
-            plugin.getLogger().log(Level.SEVERE, "Failed to load queue", e);
+
+            try (FileReader reader = new FileReader(queueFile)) {
+                Type type = new TypeToken<List<QueuedDelivery>>() {
+                }.getType();
+                List<QueuedDelivery> loaded = gson.fromJson(reader, type);
+
+                if (loaded != null) {
+                    queue.clear();
+                    for (QueuedDelivery queued : loaded) {
+                        queue.put(queued.getPurchaseId(), queued);
+                    }
+                    plugin.getLogger().info("Loaded " + queue.size() + " queued deliveries");
+                }
+            } catch (IOException | RuntimeException e) {
+                plugin.getLogger().log(Level.SEVERE, "Failed to load queue", e);
+            }
         }
+    }
+
+    private void emitPersistenceFailure(String purchaseId, UUID playerUuid, String deliveryKind) {
+        auditEmitter.emit("failed", AuditOutcome.FAILED, AuditRisk.HIGH,
+                purchaseId, playerUuid,
+                Map.of("delivery_kind", deliveryKind,
+                        "reason", "queue_persistence_failed",
+                        "state", "queue_failed"));
     }
 }
