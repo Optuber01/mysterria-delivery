@@ -47,6 +47,7 @@ public class MysterriaDelivery extends JavaPlugin {
         auditEmitter = new DeliveryAuditEmitter(this);
         queueManager = new QueueManager(this, auditEmitter);
         deliveryManager = new DeliveryManager(this, deliveryConfig, queueManager);
+        queueManager.loadQueue();
 
         getCommand("delivery").setExecutor(new DeliveryCommand(this));
 
@@ -63,8 +64,6 @@ public class MysterriaDelivery extends JavaPlugin {
         webserverService.registerHandlers(new SubscriptionDeliveryEndpoint(deliveryManager));
         webserverService.registerHandlers(new PermissionDeliveryEndpoint(deliveryManager));
         webserverService.registerHandlers(new VoteRewardDeliveryEndpoint(deliveryManager));
-
-        queueManager.loadQueue();
 
         getLogger().info("MysterriaDelivery has been enabled!");
     }

@@ -61,9 +61,13 @@ public class DeliveryManager {
         emitReceived(request);
         ClaimResult claim = claimPurchase(request.getPurchaseId());
         if (claim != ClaimResult.CLAIMED) {
-            auditEmitter.emit("duplicate-rejected", AuditOutcome.DENIED, AuditRisk.NORMAL,
-                    request.getPurchaseId(), playerUuid,
-                    Map.of("delivery_kind", "vote_reward", "state", claim.auditState));
+            if (claim == ClaimResult.REPLAY_GUARD_UNAVAILABLE) {
+                emitFailed(request.getPurchaseId(), playerUuid, "replay_guard_unavailable", "vote_reward");
+            } else {
+                auditEmitter.emit("duplicate-rejected", AuditOutcome.DENIED, AuditRisk.NORMAL,
+                        request.getPurchaseId(), playerUuid,
+                        Map.of("delivery_kind", "vote_reward", "state", claim.auditState));
+            }
             return CompletableFuture.completedFuture(
                     duplicateResponse(request.getPurchaseId(), claim)
             );
@@ -94,7 +98,7 @@ public class DeliveryManager {
         emitReceived(request);
         ClaimResult claim = claimPurchase(request.getPurchaseId());
         if (claim != ClaimResult.CLAIMED) {
-            emitDuplicate(request, claim.auditState);
+            emitClaimRejection(request, claim);
             return CompletableFuture.completedFuture(
                     duplicateResponse(request.getPurchaseId(), claim)
             );
@@ -126,7 +130,7 @@ public class DeliveryManager {
         emitReceived(request);
         ClaimResult claim = claimPurchase(request.getPurchaseId());
         if (claim != ClaimResult.CLAIMED) {
-            emitDuplicate(request, claim.auditState);
+            emitClaimRejection(request, claim);
             return CompletableFuture.completedFuture(
                     duplicateResponse(request.getPurchaseId(), claim)
             );
@@ -147,7 +151,7 @@ public class DeliveryManager {
         emitReceived(request);
         ClaimResult claim = claimPurchase(request.getPurchaseId());
         if (claim != ClaimResult.CLAIMED) {
-            emitDuplicate(request, claim.auditState);
+            emitClaimRejection(request, claim);
             return CompletableFuture.completedFuture(
                     duplicateResponse(request.getPurchaseId(), claim)
             );
@@ -538,13 +542,22 @@ public class DeliveryManager {
             plugin.getLogger().warning("Skipped a queued delivery without a valid purchase ID");
             return;
         }
+        if (!queueManager.isReplayGuardAvailable()) {
+            plugin.getLogger().severe("Skipped queued delivery because completed-purchase replay protection is unavailable: "
+                    + queued.getPurchaseId());
+            return;
+        }
+        if (queueManager.isCompleted(queued.getPurchaseId())) {
+            if (!queueManager.removeFromQueue(queued.getPurchaseId())) {
+                emitQueueCleanupFailed(queued.getPurchaseId(), queued.getPlayerUuid(), "completed_queue_replay");
+            }
+            return;
+        }
         Player player = Bukkit.getPlayer(queued.getPlayerUuid());
         if (player != null && player.isOnline()) {
             ClaimResult claim = claimPurchase(queued.getPurchaseId());
             if (claim == ClaimResult.ALREADY_PROCESSED) {
-                if (!queueManager.removeFromQueue(queued.getPurchaseId())) {
-                    emitQueueCleanupFailed(queued.getPurchaseId(), player.getUniqueId(), "queued_purchase");
-                }
+                persistQueuedCompletion(queued.getPurchaseId(), player.getUniqueId(), "queued_purchase");
                 return;
             }
             if (claim == ClaimResult.IN_PROGRESS) {
@@ -560,17 +573,15 @@ public class DeliveryManager {
                 }
                 deliverItem(player, queued.getPurchaseRequest()).thenAccept(response -> {
                     if (response.isSuccess()) {
-                        if (!queueManager.removeFromQueue(queued.getPurchaseId())) {
-                            emitQueueCleanupFailed(queued.getPurchaseId(), player.getUniqueId(), "purchase");
-                        } else if (queued.getRetryCount() > 0 && !isDiscordRole(queued.getPurchaseRequest())) {
+                        if (persistQueuedCompletion(queued.getPurchaseId(), player.getUniqueId(), "purchase")
+                                && queued.getRetryCount() > 0
+                                && !isDiscordRole(queued.getPurchaseRequest())) {
                             emitRecovered(queued.getPurchaseRequest(), player.getUniqueId(), queued.getRetryCount(), "purchase");
                         }
                     } else if (processedPurchases.contains(queued.getPurchaseId())) {
                         plugin.getLogger().severe("Purchase was only partially delivered; automatic retry is disabled: "
                                 + queued.getPurchaseId());
-                        if (!queueManager.removeFromQueue(queued.getPurchaseId())) {
-                            emitQueueCleanupFailed(queued.getPurchaseId(), player.getUniqueId(), "partial_purchase");
-                        }
+                        persistQueuedCompletion(queued.getPurchaseId(), player.getUniqueId(), "partial_purchase");
                     } else {
                         queued.setRetryCount(queued.getRetryCount() + 1);
                         if (queued.getRetryCount() >= config.getMaxRetries()) {
@@ -592,9 +603,8 @@ public class DeliveryManager {
                 }
                 deliverVoteReward(player, queued.getVoteReward()).thenAccept(response -> {
                     if (response.isSuccess()) {
-                        if (!queueManager.removeFromQueue(queued.getPurchaseId())) {
-                            emitQueueCleanupFailed(queued.getPurchaseId(), player.getUniqueId(), "vote_reward");
-                        } else if (queued.getRetryCount() > 0) {
+                        if (persistQueuedCompletion(queued.getPurchaseId(), player.getUniqueId(), "vote_reward")
+                                && queued.getRetryCount() > 0) {
                             emitRecovered(queued.getVoteReward(), player.getUniqueId(), queued.getRetryCount(), "vote_reward");
                         }
                     } else {
@@ -689,6 +699,15 @@ public class DeliveryManager {
                 Map.of("delivery_kind", "purchase", "state", state));
     }
 
+    private void emitClaimRejection(PurchaseRequest request, ClaimResult claim) {
+        if (claim == ClaimResult.REPLAY_GUARD_UNAVAILABLE) {
+            emitFailed(request.getPurchaseId(), safeUuid(request.getMinecraftUuid()),
+                    "replay_guard_unavailable", "purchase");
+        } else {
+            emitDuplicate(request, claim.auditState);
+        }
+    }
+
     private void emitDelivered(String purchaseId, UUID playerId, String deliveryKind) {
         auditEmitter.emit("delivered", AuditOutcome.COMMITTED, AuditRisk.NORMAL, purchaseId, playerId,
                 Map.of("delivery_kind", deliveryKind, "state", "delivered"));
@@ -721,13 +740,16 @@ public class DeliveryManager {
     }
 
     private ClaimResult claimPurchase(String purchaseId) {
-        if (processedPurchases.contains(purchaseId)) {
+        if (!queueManager.isReplayGuardAvailable()) {
+            return ClaimResult.REPLAY_GUARD_UNAVAILABLE;
+        }
+        if (processedPurchases.contains(purchaseId) || queueManager.isCompleted(purchaseId)) {
             return ClaimResult.ALREADY_PROCESSED;
         }
         if (!inFlightPurchases.add(purchaseId)) {
             return ClaimResult.IN_PROGRESS;
         }
-        if (processedPurchases.contains(purchaseId)) {
+        if (processedPurchases.contains(purchaseId) || queueManager.isCompleted(purchaseId)) {
             inFlightPurchases.remove(purchaseId);
             return ClaimResult.ALREADY_PROCESSED;
         }
@@ -749,6 +771,9 @@ public class DeliveryManager {
         if (claim == ClaimResult.ALREADY_PROCESSED) {
             return DeliveryResponse.success(purchaseId, "Purchase already processed");
         }
+        if (claim == ClaimResult.REPLAY_GUARD_UNAVAILABLE) {
+            return DeliveryResponse.error(purchaseId, "Purchase replay protection is unavailable");
+        }
         return DeliveryResponse.error(purchaseId, "Purchase is already being processed");
     }
 
@@ -756,6 +781,7 @@ public class DeliveryManager {
         return switch (result) {
             case QUEUED -> DeliveryResponse.queued(purchaseId, "Player offline, delivery queued");
             case ALREADY_QUEUED -> DeliveryResponse.success(purchaseId, "Purchase already queued");
+            case ALREADY_COMPLETED -> DeliveryResponse.success(purchaseId, "Purchase already processed");
             case PERSISTENCE_FAILED -> DeliveryResponse.error(purchaseId,
                     "Delivery could not be persisted to the offline queue");
         };
@@ -766,6 +792,21 @@ public class DeliveryManager {
                 Map.of("delivery_kind", deliveryKind,
                         "reason", "queue_cleanup_persistence_failed",
                         "state", "delivered_queue_retained"));
+    }
+
+    private boolean persistQueuedCompletion(String purchaseId, UUID playerId, String deliveryKind) {
+        if (!queueManager.markCompleted(purchaseId)) {
+            auditEmitter.emit("queue-cleanup-failed", AuditOutcome.FAILED, AuditRisk.HIGH, purchaseId, playerId,
+                    Map.of("delivery_kind", deliveryKind,
+                            "reason", "completed_tombstone_persistence_failed",
+                            "state", "delivered_queue_retained"));
+            return false;
+        }
+        if (!queueManager.removeFromQueue(purchaseId)) {
+            emitQueueCleanupFailed(purchaseId, playerId, deliveryKind);
+            return false;
+        }
+        return true;
     }
 
     private void emitRetryPersistenceFailed(String purchaseId, UUID playerId, String deliveryKind) {
@@ -790,7 +831,8 @@ public class DeliveryManager {
     private enum ClaimResult {
         CLAIMED("claimed"),
         ALREADY_PROCESSED("already_delivered"),
-        IN_PROGRESS("in_progress");
+        IN_PROGRESS("in_progress"),
+        REPLAY_GUARD_UNAVAILABLE("replay_guard_unavailable");
 
         private final String auditState;
 

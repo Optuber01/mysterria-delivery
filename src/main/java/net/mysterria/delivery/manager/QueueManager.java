@@ -15,17 +15,21 @@ import net.mysterria.delivery.model.QueuedDelivery;
 import net.mysterria.delivery.model.VoteReward;
 
 import java.io.File;
-import java.io.FileReader;
 import java.io.IOException;
+import java.io.Reader;
 import java.io.Writer;
 import java.lang.reflect.Type;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.LocalDateTime;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Level;
@@ -35,11 +39,12 @@ public class QueueManager {
     public enum QueueResult {
         QUEUED,
         ALREADY_QUEUED,
+        ALREADY_COMPLETED,
         PERSISTENCE_FAILED
     }
 
     private final MysterriaDelivery plugin;
-    private final Map<String, QueuedDelivery> queue = new ConcurrentHashMap<>();
+    private volatile Map<String, QueuedDelivery> queue = new ConcurrentHashMap<>();
     private final Object persistenceLock = new Object();
     private final Gson gson = new GsonBuilder()
             .setPrettyPrinting()
@@ -65,12 +70,20 @@ public class QueueManager {
             })
             .create();
     private final File queueFile;
+    private final File completedQueueFile;
+    private final File completedQueueBlockedFile;
     private final DeliveryAuditEmitter auditEmitter;
+    private volatile Set<String> completedQueuePurchases = ConcurrentHashMap.newKeySet();
+    private boolean queuePersistenceBlocked;
+    private boolean completedQueuePersistenceBlocked;
+    private volatile boolean replayGuardAvailable = true;
 
     public QueueManager(MysterriaDelivery plugin, DeliveryAuditEmitter auditEmitter) {
         this.plugin = plugin;
         this.auditEmitter = auditEmitter;
         this.queueFile = new File(plugin.getDataFolder(), "queue.json");
+        this.completedQueueFile = new File(plugin.getDataFolder(), "completed-queue.json");
+        this.completedQueueBlockedFile = new File(plugin.getDataFolder(), "completed-queue.blocked");
     }
 
     public QueueResult queueDelivery(VoteReward request) {
@@ -86,6 +99,16 @@ public class QueueManager {
                 .build();
 
         synchronized (persistenceLock) {
+            if (!replayGuardAvailable) {
+                emitPersistenceFailure(request.getPurchaseId(), playerUuid, "vote_reward");
+                return QueueResult.PERSISTENCE_FAILED;
+            }
+            if (completedQueuePurchases.contains(request.getPurchaseId())) {
+                auditEmitter.emit("duplicate-rejected", AuditOutcome.DENIED, AuditRisk.NORMAL,
+                        request.getPurchaseId(), playerUuid,
+                        Map.of("delivery_kind", "vote_reward", "state", "already_delivered"));
+                return QueueResult.ALREADY_COMPLETED;
+            }
             if (queue.putIfAbsent(request.getPurchaseId(), queued) != null) {
                 auditEmitter.emit("duplicate-rejected", AuditOutcome.DENIED, AuditRisk.NORMAL,
                         request.getPurchaseId(), playerUuid,
@@ -120,6 +143,16 @@ public class QueueManager {
                 .build();
 
         synchronized (persistenceLock) {
+            if (!replayGuardAvailable) {
+                emitPersistenceFailure(request.getPurchaseId(), playerUuid, "purchase");
+                return QueueResult.PERSISTENCE_FAILED;
+            }
+            if (completedQueuePurchases.contains(request.getPurchaseId())) {
+                auditEmitter.emit("duplicate-rejected", AuditOutcome.DENIED, AuditRisk.NORMAL,
+                        request.getPurchaseId(), playerUuid,
+                        Map.of("delivery_kind", "purchase", "state", "already_delivered"));
+                return QueueResult.ALREADY_COMPLETED;
+            }
             if (queue.putIfAbsent(request.getPurchaseId(), queued) != null) {
                 auditEmitter.emit("duplicate-rejected", AuditOutcome.DENIED, AuditRisk.NORMAL,
                         request.getPurchaseId(), playerUuid,
@@ -172,52 +205,215 @@ public class QueueManager {
     }
 
     private boolean saveQueueLocked() {
-        File temporaryFile = new File(queueFile.getParentFile(), queueFile.getName() + ".tmp");
+        if (queuePersistenceBlocked) {
+            plugin.getLogger().severe("Queue persistence is blocked because a malformed queue file could not be quarantined");
+            return false;
+        }
+        return writeAtomically(queueFile, queue.values(), "queue");
+    }
+
+    public void loadQueue() {
+        synchronized (persistenceLock) {
+            loadPendingQueueLocked();
+            loadCompletedQueueLocked();
+        }
+    }
+
+    public boolean isCompleted(String purchaseId) {
+        return purchaseId != null && completedQueuePurchases.contains(purchaseId);
+    }
+
+    public boolean isReplayGuardAvailable() {
+        return replayGuardAvailable;
+    }
+
+    public boolean markCompleted(String purchaseId) {
+        if (!isValidPurchaseId(purchaseId)) {
+            return false;
+        }
+        synchronized (persistenceLock) {
+            if (!replayGuardAvailable) {
+                return false;
+            }
+            if (completedQueuePurchases.contains(purchaseId)) {
+                return true;
+            }
+            if (completedQueuePersistenceBlocked) {
+                plugin.getLogger().severe("Completed-queue persistence is blocked because a malformed tombstone file could not be quarantined");
+                return false;
+            }
+            completedQueuePurchases.add(purchaseId);
+            if (writeAtomically(completedQueueFile, completedQueuePurchases, "completed queue")) {
+                return true;
+            }
+            completedQueuePurchases.remove(purchaseId);
+            return false;
+        }
+    }
+
+    private void loadPendingQueueLocked() {
+        if (!queueFile.exists()) {
+            return;
+        }
+
+        try (Reader reader = Files.newBufferedReader(queueFile.toPath(), StandardCharsets.UTF_8)) {
+            Type type = new TypeToken<List<QueuedDelivery>>() {
+            }.getType();
+            List<QueuedDelivery> loaded = gson.fromJson(reader, type);
+            Map<String, QueuedDelivery> candidate = validateQueue(loaded);
+            queue = new ConcurrentHashMap<>(candidate);
+            queuePersistenceBlocked = false;
+            plugin.getLogger().info("Loaded " + queue.size() + " queued deliveries");
+        } catch (IOException | RuntimeException failure) {
+            plugin.getLogger().log(Level.SEVERE, "Failed to load queue", failure);
+            queuePersistenceBlocked = !quarantine(queueFile, "malformed queue");
+        }
+    }
+
+    private void loadCompletedQueueLocked() {
+        if (completedQueueBlockedFile.exists()) {
+            completedQueuePersistenceBlocked = true;
+            replayGuardAvailable = false;
+            plugin.getLogger().severe("Completed-queue replay protection is blocked; reconcile the quarantined tombstone file and remove completed-queue.blocked");
+            return;
+        }
+        if (!completedQueueFile.exists()) {
+            return;
+        }
+
+        try (Reader reader = Files.newBufferedReader(completedQueueFile.toPath(), StandardCharsets.UTF_8)) {
+            Type type = new TypeToken<Set<String>>() {
+            }.getType();
+            Set<String> loaded = gson.fromJson(reader, type);
+            Set<String> candidate = validateCompletedPurchases(loaded);
+            Set<String> replacement = ConcurrentHashMap.newKeySet();
+            replacement.addAll(candidate);
+            completedQueuePurchases = replacement;
+            completedQueuePersistenceBlocked = false;
+            replayGuardAvailable = true;
+            plugin.getLogger().info("Loaded " + completedQueuePurchases.size() + " completed queue tombstones");
+        } catch (IOException | RuntimeException failure) {
+            plugin.getLogger().log(Level.SEVERE, "Failed to load completed queue tombstones", failure);
+            quarantine(completedQueueFile, "malformed completed queue");
+            completedQueuePersistenceBlocked = true;
+            replayGuardAvailable = false;
+            writeAtomically(completedQueueBlockedFile,
+                    Map.of("reason", "completed queue tombstones require manual reconciliation"),
+                    "completed queue block marker");
+        }
+    }
+
+    private Map<String, QueuedDelivery> validateQueue(List<QueuedDelivery> loaded) {
+        Map<String, QueuedDelivery> candidate = new LinkedHashMap<>();
+        if (loaded == null) {
+            throw new IllegalArgumentException("queue file must contain a JSON array");
+        }
+
+        for (int index = 0; index < loaded.size(); index++) {
+            QueuedDelivery queued = loaded.get(index);
+            if (queued == null) {
+                throw new IllegalArgumentException("queue entry " + index + " is null");
+            }
+            String purchaseId = queued.getPurchaseId();
+            if (!isValidPurchaseId(purchaseId)) {
+                throw new IllegalArgumentException("queue entry " + index + " has no purchase ID");
+            }
+            if (queued.getPlayerUuid() == null) {
+                throw new IllegalArgumentException("queue entry " + index + " has no player UUID");
+            }
+            if (queued.getRetryCount() < 0) {
+                throw new IllegalArgumentException("queue entry " + index + " has a negative retry count");
+            }
+
+            PurchaseRequest purchase = queued.getPurchaseRequest();
+            VoteReward vote = queued.getVoteReward();
+            if ((purchase == null) == (vote == null)) {
+                throw new IllegalArgumentException("queue entry " + index + " must contain exactly one payload");
+            }
+            String payloadId = purchase == null ? vote.getPurchaseId() : purchase.getPurchaseId();
+            if (!purchaseId.equals(payloadId)) {
+                throw new IllegalArgumentException("queue entry " + index + " has a mismatched payload ID");
+            }
+            String payloadUuid = purchase == null ? vote.getMinecraftUUID() : purchase.getMinecraftUuid();
+            if (!queued.getPlayerUuid().equals(parseUuid(payloadUuid))) {
+                throw new IllegalArgumentException("queue entry " + index + " has a mismatched payload UUID");
+            }
+            if (candidate.putIfAbsent(purchaseId, queued) != null) {
+                throw new IllegalArgumentException("queue contains duplicate purchase ID " + purchaseId);
+            }
+        }
+        return candidate;
+    }
+
+    private Set<String> validateCompletedPurchases(Set<String> loaded) {
+        Set<String> candidate = new LinkedHashSet<>();
+        if (loaded == null) {
+            throw new IllegalArgumentException("completed queue file must contain a JSON array");
+        }
+        for (String purchaseId : loaded) {
+            if (!isValidPurchaseId(purchaseId)) {
+                throw new IllegalArgumentException("completed queue contains an invalid purchase ID");
+            }
+            candidate.add(purchaseId);
+        }
+        return candidate;
+    }
+
+    private boolean writeAtomically(File targetFile, Object value, String description) {
+        File temporaryFile = new File(targetFile.getParentFile(), targetFile.getName() + ".tmp");
         try {
-            Files.createDirectories(queueFile.getParentFile().toPath());
+            Files.createDirectories(targetFile.getParentFile().toPath());
             try (Writer writer = Files.newBufferedWriter(temporaryFile.toPath(), StandardCharsets.UTF_8)) {
-                gson.toJson(queue.values(), writer);
+                gson.toJson(value, writer);
             }
-            try {
-                Files.move(temporaryFile.toPath(), queueFile.toPath(),
-                        StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-            } catch (AtomicMoveNotSupportedException ignored) {
-                Files.move(temporaryFile.toPath(), queueFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
-            }
+            moveReplacing(temporaryFile.toPath(), targetFile.toPath());
             return true;
-        } catch (IOException e) {
-            plugin.getLogger().log(Level.SEVERE, "Failed to save queue", e);
+        } catch (IOException | RuntimeException failure) {
+            plugin.getLogger().log(Level.SEVERE, "Failed to save " + description, failure);
             try {
                 Files.deleteIfExists(temporaryFile.toPath());
-            } catch (IOException cleanupFailure) {
-                plugin.getLogger().log(Level.FINE, "Failed to clean up temporary queue file", cleanupFailure);
+            } catch (IOException | RuntimeException cleanupFailure) {
+                plugin.getLogger().log(Level.FINE,
+                        "Failed to clean up temporary " + description + " file", cleanupFailure);
             }
             return false;
         }
     }
 
-    public void loadQueue() {
-        synchronized (persistenceLock) {
-            if (!queueFile.exists()) {
-                return;
-            }
-
-            try (FileReader reader = new FileReader(queueFile)) {
-                Type type = new TypeToken<List<QueuedDelivery>>() {
-                }.getType();
-                List<QueuedDelivery> loaded = gson.fromJson(reader, type);
-
-                if (loaded != null) {
-                    queue.clear();
-                    for (QueuedDelivery queued : loaded) {
-                        queue.put(queued.getPurchaseId(), queued);
-                    }
-                    plugin.getLogger().info("Loaded " + queue.size() + " queued deliveries");
-                }
-            } catch (IOException | RuntimeException e) {
-                plugin.getLogger().log(Level.SEVERE, "Failed to load queue", e);
-            }
+    private boolean quarantine(File sourceFile, String description) {
+        Path source = sourceFile.toPath();
+        Path quarantine = source.resolveSibling(sourceFile.getName() + ".corrupt-" + System.currentTimeMillis());
+        try {
+            moveReplacing(source, quarantine);
+            plugin.getLogger().severe("Moved " + description + " file to " + quarantine.getFileName());
+            return true;
+        } catch (IOException | RuntimeException failure) {
+            plugin.getLogger().log(Level.SEVERE, "Failed to quarantine " + description + " file", failure);
+            return false;
         }
+    }
+
+    private void moveReplacing(Path source, Path target) throws IOException {
+        try {
+            Files.move(source, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+        } catch (AtomicMoveNotSupportedException ignored) {
+            Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
+    private UUID parseUuid(String value) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        try {
+            return UUID.fromString(value);
+        } catch (IllegalArgumentException ignored) {
+            return null;
+        }
+    }
+
+    private boolean isValidPurchaseId(String purchaseId) {
+        return purchaseId != null && !purchaseId.isBlank();
     }
 
     private void emitPersistenceFailure(String purchaseId, UUID playerUuid, String deliveryKind) {

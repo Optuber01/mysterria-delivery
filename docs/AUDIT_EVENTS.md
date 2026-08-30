@@ -6,6 +6,14 @@ Events are written to the shared SQLite audit ledger. The purchase ID is retaine
 `businessId`; a deterministic UUID derived from it is used as `correlationId`, so queue,
 restart, retry, and delivery events remain linked.
 
+Queued deliveries also retain completed purchase IDs in `completed-queue.json`. This
+tombstone file prevents a queue entry whose cleanup failed from being delivered again after
+a restart. It contains purchase IDs only and uses the same atomic UTF-8 persistence as the
+pending queue. Malformed queue files are moved aside with a `.corrupt-<timestamp>` suffix.
+If the completed tombstones are malformed, queued delivery remains disabled across restarts
+through `completed-queue.blocked` until an operator reconciles the quarantined file and removes
+the marker.
+
 | Event | Meaning | Metadata |
 | --- | --- | --- |
 | `mysterria-delivery.purchase.received` | A purchase request entered delivery processing. | `delivery_kind`, `service_name` or `source` |
