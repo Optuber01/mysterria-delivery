@@ -1,25 +1,24 @@
 package net.mysterria.delivery.audit;
 
-import dev.ua.ikeepcalm.coi.api.audit.AuditEmission;
-import dev.ua.ikeepcalm.coi.api.audit.AuditOutcome;
-import dev.ua.ikeepcalm.coi.api.audit.AuditPrivacy;
-import dev.ua.ikeepcalm.coi.api.audit.AuditRisk;
-import dev.ua.ikeepcalm.coi.api.audit.MysterriaAudit;
-import org.bukkit.Bukkit;
-import org.bukkit.plugin.RegisteredServiceProvider;
+import dev.ua.ikeepcalm.mysterria.audit.client.api.AuditOutcome;
+import dev.ua.ikeepcalm.mysterria.audit.client.api.AuditPrivacy;
+import dev.ua.ikeepcalm.mysterria.audit.client.api.AuditProducer;
+import dev.ua.ikeepcalm.mysterria.audit.client.api.AuditRisk;
 import org.bukkit.plugin.java.JavaPlugin;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.UUID;
-import java.util.logging.Level;
 
-/** Best-effort bridge to the optional MysterriaLogging provider. */
-public final class DeliveryAuditEmitter {
-    private final JavaPlugin plugin;
+/** Best-effort producer for delivery audit events. */
+public final class DeliveryAuditEmitter implements AutoCloseable {
+    private final AuditProducer producer;
 
     public DeliveryAuditEmitter(JavaPlugin plugin) {
-        this.plugin = plugin;
+        this.producer = AuditProducer.create(
+                plugin.getDataFolder().toPath().toAbsolutePath().getParent(),
+                "mysterria-delivery",
+                plugin.getPluginMeta().getVersion());
     }
 
     public void emit(String event, AuditOutcome outcome, AuditRisk risk, String purchaseId,
@@ -28,34 +27,27 @@ public final class DeliveryAuditEmitter {
             return;
         }
 
-        try {
-            RegisteredServiceProvider<MysterriaAudit> registration =
-                    Bukkit.getServicesManager().getRegistration(MysterriaAudit.class);
-            MysterriaAudit audit = registration == null ? null : registration.getProvider();
-            if (audit == null) {
-                return;
-            }
-
-            audit.emit(new AuditEmission(
-                    "mysterria-delivery.purchase." + event,
-                    outcome,
-                    risk,
-                    AuditPrivacy.STAFF_RESTRICTED,
-                    correlationId(purchaseId),
-                    purchaseId,
-                    playerId,
-                    playerId,
-                    null,
-                    null,
-                    metadata == null ? Map.of() : Map.copyOf(metadata)));
-        } catch (RuntimeException | LinkageError failure) {
-            // Audit is optional and must never affect delivery or request handling.
-            plugin.getLogger().log(Level.FINE, "Mysterria audit emission was unavailable", failure);
-        }
+        producer.emit(
+                "mysterria-delivery.purchase." + event,
+                outcome,
+                risk,
+                AuditPrivacy.STAFF_RESTRICTED,
+                correlationId(purchaseId),
+                purchaseId,
+                playerId,
+                playerId,
+                null,
+                null,
+                metadata == null ? Map.of() : Map.copyOf(metadata));
     }
 
     private UUID correlationId(String purchaseId) {
         return UUID.nameUUIDFromBytes(
                 ("mysterria-delivery:purchase:" + purchaseId).getBytes(StandardCharsets.UTF_8));
+    }
+
+    @Override
+    public void close() {
+        producer.close();
     }
 }

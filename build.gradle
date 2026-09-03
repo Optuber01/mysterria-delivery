@@ -1,5 +1,6 @@
 plugins {
     id 'java'
+    id('com.gradleup.shadow') version '9.4.1'
     id("xyz.jpenilla.run-paper") version "2.3.1"
 }
 
@@ -7,6 +8,7 @@ group = 'net.mysterria'
 version = '1.0.1'
 
 repositories {
+    mavenLocal()
     mavenCentral()
     maven {
         name = "papermc-repo"
@@ -22,12 +24,7 @@ dependencies {
     compileOnly("io.javalin.community.openapi:javalin-openapi-plugin:6.6.0")
     compileOnly("io.javalin.community.openapi:javalin-swagger-plugin:6.6.0")
     compileOnly("com.github.ikeepcalm:catwalk:v.0.8")
-    def coiApiJar = project.findProperty('coiApiJar')
-    if (coiApiJar) {
-        compileOnly files(coiApiJar)
-    } else {
-        compileOnly 'dev.ua.ikeepcalm:circle-of-imagination-api:1.4.8-SNAPSHOT'
-    }
+    implementation 'dev.ua.ikeepcalm.mysterria:audit-client:1.0.0-SNAPSHOT'
     compileOnly 'org.projectlombok:lombok:1.18.44'
     compileOnly 'net.luckperms:api:5.4'
     annotationProcessor("io.javalin.community.openapi:openapi-annotation-processor:6.6.0")
@@ -35,6 +32,13 @@ dependencies {
     compileOnly("io.papermc.paper:paper-api:1.21.8-R0.1-SNAPSHOT")
     implementation 'org.yaml:snakeyaml:2.2'
     implementation 'com.google.code.gson:gson:2.10.1'
+}
+
+tasks.build.dependsOn tasks.shadowJar
+
+shadowJar {
+    archiveClassifier.set('')
+    relocate 'dev.ua.ikeepcalm.mysterria.audit', 'net.mysterria.delivery.libs.audit'
 }
 
 tasks {

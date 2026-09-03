@@ -1,7 +1,7 @@
 package net.mysterria.delivery.manager;
 
-import dev.ua.ikeepcalm.coi.api.audit.AuditOutcome;
-import dev.ua.ikeepcalm.coi.api.audit.AuditRisk;
+import dev.ua.ikeepcalm.mysterria.audit.client.api.AuditOutcome;
+import dev.ua.ikeepcalm.mysterria.audit.client.api.AuditRisk;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.minimessage.MiniMessage;
 import net.luckperms.api.node.Node;

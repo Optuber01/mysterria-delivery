@@ -70,6 +70,9 @@ public class MysterriaDelivery extends JavaPlugin {
 
     @Override
     public void onDisable() {
+        if (auditEmitter != null) {
+            auditEmitter.close();
+        }
         if (queueManager != null) {
             queueManager.saveQueue();
         }
