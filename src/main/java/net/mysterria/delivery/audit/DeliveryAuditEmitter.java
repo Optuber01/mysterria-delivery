@@ -16,7 +16,8 @@ public final class DeliveryAuditEmitter implements AutoCloseable {
 
     public DeliveryAuditEmitter(JavaPlugin plugin) {
         this.producer = AuditProducer.create(
-                plugin.getDataFolder().toPath().toAbsolutePath().getParent(),
+                plugin.getDataFolder().toPath().toAbsolutePath().getParent()
+                        .resolve("mysterria-audit-spool"),
                 "mysterria-delivery",
                 plugin.getPluginMeta().getVersion());
     }

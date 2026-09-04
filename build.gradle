@@ -24,7 +24,7 @@ dependencies {
     compileOnly("io.javalin.community.openapi:javalin-openapi-plugin:6.6.0")
     compileOnly("io.javalin.community.openapi:javalin-swagger-plugin:6.6.0")
     compileOnly("com.github.ikeepcalm:catwalk:v.0.8")
-    implementation 'dev.ua.ikeepcalm.mysterria:audit-client:1.0.0-SNAPSHOT'
+    implementation 'dev.ua.ikeepcalm.mysterria:audit-client:1.0.0'
     compileOnly 'org.projectlombok:lombok:1.18.44'
     compileOnly 'net.luckperms:api:5.4'
     annotationProcessor("io.javalin.community.openapi:openapi-annotation-processor:6.6.0")
