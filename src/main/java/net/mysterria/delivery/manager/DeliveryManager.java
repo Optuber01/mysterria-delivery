@@ -24,6 +24,10 @@ import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
 
 public class DeliveryManager {
@@ -35,12 +39,24 @@ public class DeliveryManager {
     private final MiniMessage miniMessage = MiniMessage.miniMessage();
     private DeliveryConfig config;
     private final DeliveryAuditEmitter auditEmitter;
+    private final ThreadPoolExecutor completionWriter;
 
     public DeliveryManager(MysterriaDelivery plugin, DeliveryConfig config, QueueManager queueManager) {
         this.plugin = plugin;
         this.config = config;
         this.queueManager = queueManager;
         this.auditEmitter = plugin.getAuditEmitter();
+        this.completionWriter = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS,
+                new ArrayBlockingQueue<>(256), task -> {
+                    Thread thread = new Thread(task, "mysterria-delivery-completions");
+                    thread.setDaemon(true);
+                    return thread;
+                }, new ThreadPoolExecutor.AbortPolicy()) {
+            @Override
+            protected void terminated() {
+                auditEmitter.close();
+            }
+        };
     }
 
     public void reload(DeliveryConfig newConfig) {
@@ -201,7 +217,7 @@ public class DeliveryManager {
             result.complete(DeliveryResponse.error(request.getPurchaseId(),
                     "Delivery failed: " + failure.getMessage()));
         }
-        return result;
+        return persistCompletion(result, request.getPurchaseId(), player.getUniqueId(), "vote_reward");
     }
 
     private CompletableFuture<DeliveryResponse> deliverItem(Player player, PurchaseRequest request) {
@@ -296,7 +312,7 @@ public class DeliveryManager {
             result.complete(DeliveryResponse.error(request.getPurchaseId(),
                     "Delivery failed: " + failure.getMessage()));
         }
-        return result;
+        return persistCompletion(result, request.getPurchaseId(), player.getUniqueId(), "purchase");
     }
 
     private CompletableFuture<DeliveryResponse> deliverSubscription(UUID playerUuid, PurchaseRequest request) {
@@ -334,7 +350,7 @@ public class DeliveryManager {
                     "Subscription delivery failed: " + failure.getMessage()));
         }
 
-        return mutation.handle((ignored, failure) -> {
+        CompletableFuture<DeliveryResponse> result = mutation.handle((ignored, failure) -> {
             if (failure != null) {
                 releasePurchase(request.getPurchaseId());
                 emitFailed(request.getPurchaseId(), playerUuid, "delivery_exception", "subscription");
@@ -351,6 +367,7 @@ public class DeliveryManager {
 
             return DeliveryResponse.success(request.getPurchaseId(), "Subscription granted successfully");
         });
+        return persistCompletion(result, request.getPurchaseId(), playerUuid, "subscription");
     }
 
     private CompletableFuture<DeliveryResponse> deliverPermission(UUID playerUuid, PurchaseRequest request) {
@@ -391,7 +408,7 @@ public class DeliveryManager {
                     "Permission delivery failed: " + failure.getMessage()));
         }
 
-        return mutation.handle((ignored, failure) -> {
+        CompletableFuture<DeliveryResponse> result = mutation.handle((ignored, failure) -> {
             if (failure != null) {
                 releasePurchase(request.getPurchaseId());
                 emitFailed(request.getPurchaseId(), playerUuid, "delivery_exception", "permission");
@@ -408,21 +425,51 @@ public class DeliveryManager {
 
             return DeliveryResponse.success(request.getPurchaseId(), "Permissions granted successfully");
         });
+        return persistCompletion(result, request.getPurchaseId(), playerUuid, "permission");
     }
 
-    private CompletableFuture<DeliveryResponse> deliverDiscordRole(PurchaseRequest request) {
-        return CompletableFuture.supplyAsync(() -> {
-            plugin.getLogger().info("Discord role purchase: " + request.getServiceName() + " by " + request.getNickname());
-
-            Player player = Bukkit.getPlayer(UUID.fromString(request.getMinecraftUuid()));
-            if (player != null) {
-                schedulePurchaseAnnouncement(player, request);
+    /** Persist both online and queued outcomes before acknowledging them to the caller.
+     * Commands and storage cannot form an atomic transaction: a crash between them
+     * still requires reconciliation. Partial grants are also tombstoned, never retried.
+     */
+    private CompletableFuture<DeliveryResponse> persistCompletion(CompletableFuture<DeliveryResponse> delivery,
+            String purchaseId, UUID playerId, String kind) {
+        return delivery.thenCompose(response -> {
+            if (!processedPurchases.contains(purchaseId)) {
+                return CompletableFuture.completedFuture(response);
             }
-
-            completePurchase(request.getPurchaseId());
-
-            return DeliveryResponse.success(request.getPurchaseId(), "Discord role logged successfully");
+            CompletableFuture<DeliveryResponse> persisted = new CompletableFuture<>();
+            try {
+                completionWriter.execute(() -> {
+                    try {
+                        if (queueManager.markCompleted(purchaseId)) {
+                            inFlightPurchases.remove(purchaseId);
+                            persisted.complete(response);
+                        } else {
+                            persisted.complete(completionFailure(purchaseId, playerId, kind));
+                        }
+                    } catch (RuntimeException failure) {
+                        persisted.complete(completionFailure(purchaseId, playerId, kind));
+                    }
+                });
+            } catch (RejectedExecutionException failure) {
+                persisted.complete(completionFailure(purchaseId, playerId, kind));
+            }
+            return persisted;
         });
+    }
+
+    private DeliveryResponse completionFailure(String purchaseId, UUID playerId, String kind) {
+        auditEmitter.emit("completion-persistence-failed", AuditOutcome.FAILED, AuditRisk.HIGH,
+                purchaseId, playerId, Map.of("delivery_kind", kind,
+                        "reason", "completion_tombstone_not_persisted", "requires_reconciliation", true));
+        return DeliveryResponse.error(purchaseId,
+                "Delivery effects occurred but replay protection could not be saved; reconciliation required");
+    }
+
+    public void close() {
+        // Drain accepted writes off-thread; never wait for disk from the server thread.
+        completionWriter.shutdown();
     }
 
     private void announceVoteDelivery(Player player, VoteReward request) {
@@ -741,9 +788,6 @@ public class DeliveryManager {
         if (!queueManager.isReplayGuardAvailable()) {
             return ClaimResult.REPLAY_GUARD_UNAVAILABLE;
         }
-        if (processedPurchases.contains(purchaseId) || queueManager.isCompleted(purchaseId)) {
-            return ClaimResult.ALREADY_PROCESSED;
-        }
         if (!inFlightPurchases.add(purchaseId)) {
             return ClaimResult.IN_PROGRESS;
         }
@@ -756,7 +800,6 @@ public class DeliveryManager {
 
     private void completePurchase(String purchaseId) {
         processedPurchases.add(purchaseId);
-        inFlightPurchases.remove(purchaseId);
     }
 
     private void releasePurchase(String purchaseId) {

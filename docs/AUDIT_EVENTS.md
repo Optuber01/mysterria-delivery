@@ -4,13 +4,20 @@ MysterriaDelivery emits best-effort events through its shaded neutral audit clie
 
 The optional per-server audit engine owns SQLite and local staff searches. Each producer writes to its own bounded spool directory even when the engine is absent. Existing gameplay dependencies remain separate from audit transport.
 
-Queued deliveries also retain completed purchase IDs in `completed-queue.json`. This
+Online and queued deliveries retain completed purchase IDs in `completed-queue.json`. This
 tombstone file prevents a queue entry whose cleanup failed from being delivered again after
 a restart. It contains purchase IDs only and uses the same atomic UTF-8 persistence as the
 pending queue. Malformed queue files are moved aside with a `.corrupt-<timestamp>` suffix.
 If the completed tombstones are malformed, queued delivery remains disabled across restarts
 through `completed-queue.blocked` until an operator reconciles the quarantined file and removes
 the marker.
+
+Online completion writes run on a bounded background worker before the response is
+acknowledged. Partial command execution also retains a tombstone to prevent automatic
+replay. A failed or rejected completion write returns a reconciliation error and keeps
+the purchase blocked in memory. This is not an atomic transaction with Minecraft commands
+or LuckPerms: a process crash after effects but before the tombstone is saved can still
+require manual reconciliation. The `delivered` event describes effects, not tombstone durability.
 
 | Event | Meaning | Metadata |
 | --- | --- | --- |
@@ -20,6 +27,7 @@ the marker.
 | `mysterria-delivery.purchase.discord-role-requested` | A Discord-role request was observed; this plugin does not claim external role delivery. | `delivery_kind`, `service_name` |
 | `mysterria-delivery.purchase.delivered` | Delivery commands or entitlement mutation completed at the plugin commit point. | `delivery_kind`, `state` |
 | `mysterria-delivery.purchase.failed` | Delivery configuration, command execution, or entitlement mutation failed. | `delivery_kind`, `reason`, `state` |
+| `mysterria-delivery.purchase.completion-persistence-failed` | Effects occurred, but completion storage failed or its bounded worker rejected admission. Automatic replay remains blocked in memory; reconcile before restart. | `delivery_kind`, `reason`, `requires_reconciliation` |
 | `mysterria-delivery.purchase.recovered` | A queued delivery succeeded after one or more retries. | `delivery_kind`, `retry_count`, `state` |
 | `mysterria-delivery.purchase.queue-cleanup-failed` | Delivery succeeded, but the persisted queue entry could not be removed. | `delivery_kind`, `reason`, `state` |
 | `mysterria-delivery.purchase.retry-persistence-failed` | A failed delivery's updated retry count could not be persisted. | `delivery_kind`, `reason`, `state` |

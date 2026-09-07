@@ -70,7 +70,9 @@ public class MysterriaDelivery extends JavaPlugin {
 
     @Override
     public void onDisable() {
-        if (auditEmitter != null) {
+        if (deliveryManager != null) {
+            deliveryManager.close();
+        } else if (auditEmitter != null) {
             auditEmitter.close();
         }
         if (queueManager != null) {
