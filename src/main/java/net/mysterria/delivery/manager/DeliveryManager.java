@@ -175,7 +175,6 @@ public class DeliveryManager {
         try {
             Bukkit.getScheduler().runTask(plugin, () -> {
                 try {
-                    plugin.getLogger().info("Executing command: " + command);
                     if (!Bukkit.dispatchCommand(Bukkit.getConsoleSender(), command)) {
                         releasePurchase(request.getPurchaseId());
                         emitFailed(request.getPurchaseId(), player.getUniqueId(), "command_rejected", "vote_reward");
@@ -252,7 +251,6 @@ public class DeliveryManager {
                 int dispatchedCommands = 0;
                 try {
                     for (String command : renderedCommands) {
-                        plugin.getLogger().info("Executing command: " + command);
                         if (!Bukkit.dispatchCommand(Bukkit.getConsoleSender(), command)) {
                             if (dispatchedCommands == 0) {
                                 releasePurchase(request.getPurchaseId());

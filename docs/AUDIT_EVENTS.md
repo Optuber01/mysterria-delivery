@@ -1,10 +1,8 @@
 # MysterriaDelivery audit events
 
-MysterriaDelivery emits best-effort events through the optional COI `MysterriaAudit`
-service. If the service is absent or unavailable, delivery continues unchanged.
-Events are written to the shared SQLite audit ledger. The purchase ID is retained as
-`businessId`; a deterministic UUID derived from it is used as `correlationId`, so queue,
-restart, retry, and delivery events remain linked.
+MysterriaDelivery emits best-effort events through its shaded neutral audit client. The optional local engine ingests spool segments into SQLite. The purchase ID is retained as `business_id`; its deterministic correlation UUID links queue, restart, retry, and delivery events. Audit failures do not change delivery behavior.
+
+The optional per-server audit engine owns SQLite and local staff searches. Each producer writes to its own bounded spool directory even when the engine is absent. Existing gameplay dependencies remain separate from audit transport.
 
 Queued deliveries also retain completed purchase IDs in `completed-queue.json`. This
 tombstone file prevents a queue entry whose cleanup failed from being delivered again after

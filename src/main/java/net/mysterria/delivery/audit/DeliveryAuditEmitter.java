@@ -39,7 +39,7 @@ public final class DeliveryAuditEmitter implements AutoCloseable {
                 playerId,
                 null,
                 null,
-                metadata == null ? Map.of() : Map.copyOf(metadata));
+                metadata);
     }
 
     private UUID correlationId(String purchaseId) {
