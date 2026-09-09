@@ -1,5 +1,18 @@
 # MysterriaDelivery audit events
 
+`completed-queue.json` now stores purchase IDs mapped to `DELIVERED`, `PARTIAL`, or `LEGACY`.
+Partial execution remains replay-blocked but never returns a successful completion receipt.
+Old ID-only arrays load conservatively as `LEGACY`: they prevent re-execution but require
+reconciliation before anyone can claim full success. Unknown states block replay protection
+through the existing quarantine/blocked-marker path. State and ID are written atomically in
+one file. A repeat completion response does not invent an original delivery timestamp.
+
+Queued and already-queued responses carry `queued=true` and no completion timestamp.
+The backend must inspect the inner receipt and matching purchase ID, not treat HTTP 2xx as delivered.
+Purchase payloads accept both `quantity` and the backend's `amount` alias; omitted quantities
+default to one for both JSON and builder construction. Routine queue/grant console chatter is
+debug-level; replay guards, pending queue and failure diagnostics remain active.
+
 MysterriaDelivery emits best-effort events through its shaded neutral audit client. The optional local engine ingests spool segments into SQLite. The purchase ID is retained as `business_id`; its deterministic correlation UUID links queue, restart, retry, and delivery events. Audit failures do not change delivery behavior.
 
 The optional per-server audit engine owns SQLite and local staff searches. Each producer writes to its own bounded spool directory even when the engine is absent. Existing gameplay dependencies remain separate from audit transport.

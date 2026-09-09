@@ -361,7 +361,7 @@ public class DeliveryManager {
 
             completePurchase(request.getPurchaseId());
             emitDelivered(request.getPurchaseId(), playerUuid, "subscription");
-            plugin.getLogger().info("Granted subscription " + groupName + " to " + playerUuid + " for " + duration);
+            plugin.getLogger().fine("Granted subscription " + groupName + " to " + playerUuid + " for " + duration);
 
             schedulePurchaseAnnouncement(playerUuid, request);
 
@@ -419,7 +419,7 @@ public class DeliveryManager {
 
             completePurchase(request.getPurchaseId());
             emitDelivered(request.getPurchaseId(), playerUuid, "permission");
-            plugin.getLogger().info("Granted permissions " + permissions + " to " + playerUuid + " for " + duration);
+            plugin.getLogger().fine("Granted permissions " + permissions + " to " + playerUuid + " for " + duration);
 
             schedulePurchaseAnnouncement(playerUuid, request);
 
@@ -442,7 +442,7 @@ public class DeliveryManager {
             try {
                 completionWriter.execute(() -> {
                     try {
-                        if (queueManager.markCompleted(purchaseId)) {
+                        if (queueManager.markCompleted(purchaseId, !response.isSuccess())) {
                             inFlightPurchases.remove(purchaseId);
                             persisted.complete(response);
                         } else {
@@ -810,7 +810,7 @@ public class DeliveryManager {
 
     private DeliveryResponse duplicateResponse(String purchaseId, ClaimResult claim) {
         if (claim == ClaimResult.ALREADY_PROCESSED) {
-            return DeliveryResponse.success(purchaseId, "Purchase already processed");
+            return completedResponse(purchaseId);
         }
         if (claim == ClaimResult.REPLAY_GUARD_UNAVAILABLE) {
             return DeliveryResponse.error(purchaseId, "Purchase replay protection is unavailable");
@@ -818,11 +818,15 @@ public class DeliveryManager {
         return DeliveryResponse.error(purchaseId, "Purchase is already being processed");
     }
 
+    private DeliveryResponse completedResponse(String purchaseId) {
+        return CompletionHistory.response(purchaseId, queueManager.completionState(purchaseId));
+    }
+
     private DeliveryResponse queueResponse(String purchaseId, QueueManager.QueueResult result) {
         return switch (result) {
             case QUEUED -> DeliveryResponse.queued(purchaseId, "Player offline, delivery queued");
-            case ALREADY_QUEUED -> DeliveryResponse.success(purchaseId, "Purchase already queued");
-            case ALREADY_COMPLETED -> DeliveryResponse.success(purchaseId, "Purchase already processed");
+            case ALREADY_QUEUED -> DeliveryResponse.queued(purchaseId, "Purchase already queued");
+            case ALREADY_COMPLETED -> completedResponse(purchaseId);
             case PERSISTENCE_FAILED -> DeliveryResponse.error(purchaseId,
                     "Delivery could not be persisted to the offline queue");
         };
@@ -836,7 +840,7 @@ public class DeliveryManager {
     }
 
     private boolean persistQueuedCompletion(String purchaseId, UUID playerId, String deliveryKind) {
-        if (!queueManager.markCompleted(purchaseId)) {
+        if (!queueManager.markCompleted(purchaseId, deliveryKind.startsWith("partial"))) {
             auditEmitter.emit("queue-cleanup-failed", AuditOutcome.FAILED, AuditRisk.HIGH, purchaseId, playerId,
                     Map.of("delivery_kind", deliveryKind,
                             "reason", "completed_tombstone_persistence_failed",
@@ -871,7 +875,7 @@ public class DeliveryManager {
 
     private enum ClaimResult {
         CLAIMED("claimed"),
-        ALREADY_PROCESSED("already_delivered"),
+        ALREADY_PROCESSED("replay_blocked"),
         IN_PROGRESS("in_progress"),
         REPLAY_GUARD_UNAVAILABLE("replay_guard_unavailable");
 

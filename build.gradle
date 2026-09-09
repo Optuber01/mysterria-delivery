@@ -19,6 +19,9 @@ repositories {
 }
 
 dependencies {
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.11.4'
+    testImplementation 'com.fasterxml.jackson.core:jackson-databind:2.17.2'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
     compileOnly("io.javalin:javalin-bundle:6.6.0")
     compileOnly 'io.swagger.core.v3:swagger-annotations:2.2.21'
     compileOnly("io.javalin.community.openapi:javalin-openapi-plugin:6.6.0")
@@ -35,6 +38,7 @@ dependencies {
 }
 
 tasks.build.dependsOn tasks.shadowJar
+tasks.test { useJUnitPlatform() }
 
 shadowJar {
     archiveClassifier.set('')

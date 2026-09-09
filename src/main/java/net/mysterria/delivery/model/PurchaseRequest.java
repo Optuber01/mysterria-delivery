@@ -52,6 +52,8 @@ public class PurchaseRequest {
     private String expiresAt;
 
     @JsonProperty("quantity")
+    @com.fasterxml.jackson.annotation.JsonAlias("amount")
+    @Builder.Default
     private Integer quantity = 1;
 
     public static class LocalDateTimeArrayDeserializer extends JsonDeserializer<String> {

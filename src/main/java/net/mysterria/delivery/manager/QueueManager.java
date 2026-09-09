@@ -26,10 +26,10 @@ import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.LocalDateTime;
 import java.util.LinkedHashMap;
-import java.util.LinkedHashSet;
+
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
+
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.logging.Level;
@@ -73,7 +73,7 @@ public class QueueManager {
     private final File completedQueueFile;
     private final File completedQueueBlockedFile;
     private final DeliveryAuditEmitter auditEmitter;
-    private volatile Set<String> completedQueuePurchases = ConcurrentHashMap.newKeySet();
+    private volatile Map<String, CompletionHistory.State> completedQueuePurchases = new ConcurrentHashMap<>();
     private boolean queuePersistenceBlocked;
     private boolean completedQueuePersistenceBlocked;
     private volatile boolean replayGuardAvailable = true;
@@ -103,10 +103,10 @@ public class QueueManager {
                 emitPersistenceFailure(request.getPurchaseId(), playerUuid, "vote_reward");
                 return QueueResult.PERSISTENCE_FAILED;
             }
-            if (completedQueuePurchases.contains(request.getPurchaseId())) {
+            if (completedQueuePurchases.containsKey(request.getPurchaseId())) {
                 auditEmitter.emit("duplicate-rejected", AuditOutcome.DENIED, AuditRisk.NORMAL,
                         request.getPurchaseId(), playerUuid,
-                        Map.of("delivery_kind", "vote_reward", "state", "already_delivered"));
+                        Map.of("delivery_kind", "vote_reward", "state", "replay_blocked"));
                 return QueueResult.ALREADY_COMPLETED;
             }
             if (queue.putIfAbsent(request.getPurchaseId(), queued) != null) {
@@ -126,7 +126,7 @@ public class QueueManager {
                 request.getPurchaseId(), playerUuid,
                 Map.of("delivery_kind", "vote_reward", "state", "queued"));
 
-        plugin.getLogger().info("Queued delivery for offline player: " + request.getPlayer());
+        plugin.getLogger().fine("Queued delivery for offline player: " + request.getPlayer());
         return QueueResult.QUEUED;
     }
 
@@ -147,10 +147,10 @@ public class QueueManager {
                 emitPersistenceFailure(request.getPurchaseId(), playerUuid, "purchase");
                 return QueueResult.PERSISTENCE_FAILED;
             }
-            if (completedQueuePurchases.contains(request.getPurchaseId())) {
+            if (completedQueuePurchases.containsKey(request.getPurchaseId())) {
                 auditEmitter.emit("duplicate-rejected", AuditOutcome.DENIED, AuditRisk.NORMAL,
                         request.getPurchaseId(), playerUuid,
-                        Map.of("delivery_kind", "purchase", "state", "already_delivered"));
+                        Map.of("delivery_kind", "purchase", "state", "replay_blocked"));
                 return QueueResult.ALREADY_COMPLETED;
             }
             if (queue.putIfAbsent(request.getPurchaseId(), queued) != null) {
@@ -174,7 +174,7 @@ public class QueueManager {
                         request.getServiceName() == null ? "" : request.getServiceName(),
                         "state", "queued"));
 
-        plugin.getLogger().info("Queued delivery for offline player: " + request.getNickname());
+        plugin.getLogger().fine("Queued delivery for offline player: " + request.getNickname());
         return QueueResult.QUEUED;
     }
 
@@ -220,7 +220,7 @@ public class QueueManager {
     }
 
     public boolean isCompleted(String purchaseId) {
-        return purchaseId != null && completedQueuePurchases.contains(purchaseId);
+        return purchaseId != null && completedQueuePurchases.containsKey(purchaseId);
     }
 
     public boolean isReplayGuardAvailable() {
@@ -228,6 +228,12 @@ public class QueueManager {
     }
 
     public boolean markCompleted(String purchaseId) {
+        return markCompleted(purchaseId, false);
+    }
+
+    CompletionHistory.State completionState(String purchaseId) { return completedQueuePurchases.get(purchaseId); }
+
+    public boolean markCompleted(String purchaseId, boolean partial) {
         if (!isValidPurchaseId(purchaseId)) {
             return false;
         }
@@ -235,14 +241,14 @@ public class QueueManager {
             if (!replayGuardAvailable) {
                 return false;
             }
-            if (completedQueuePurchases.contains(purchaseId)) {
+            if (completedQueuePurchases.containsKey(purchaseId)) {
                 return true;
             }
             if (completedQueuePersistenceBlocked) {
                 plugin.getLogger().severe("Completed-queue persistence is blocked because a malformed tombstone file could not be quarantined");
                 return false;
             }
-            completedQueuePurchases.add(purchaseId);
+            completedQueuePurchases.put(purchaseId, partial ? CompletionHistory.State.PARTIAL : CompletionHistory.State.DELIVERED);
             if (writeAtomically(completedQueueFile, completedQueuePurchases, "completed queue")) {
                 return true;
             }
@@ -263,7 +269,7 @@ public class QueueManager {
             Map<String, QueuedDelivery> candidate = validateQueue(loaded);
             queue = new ConcurrentHashMap<>(candidate);
             queuePersistenceBlocked = false;
-            plugin.getLogger().info("Loaded " + queue.size() + " queued deliveries");
+            plugin.getLogger().fine("Loaded " + queue.size() + " queued deliveries");
         } catch (IOException | RuntimeException failure) {
             plugin.getLogger().log(Level.SEVERE, "Failed to load queue", failure);
             queuePersistenceBlocked = !quarantine(queueFile, "malformed queue");
@@ -282,16 +288,10 @@ public class QueueManager {
         }
 
         try (Reader reader = Files.newBufferedReader(completedQueueFile.toPath(), StandardCharsets.UTF_8)) {
-            Type type = new TypeToken<Set<String>>() {
-            }.getType();
-            Set<String> loaded = gson.fromJson(reader, type);
-            Set<String> candidate = validateCompletedPurchases(loaded);
-            Set<String> replacement = ConcurrentHashMap.newKeySet();
-            replacement.addAll(candidate);
-            completedQueuePurchases = replacement;
+            completedQueuePurchases = new ConcurrentHashMap<>(CompletionHistory.read(reader));
             completedQueuePersistenceBlocked = false;
             replayGuardAvailable = true;
-            plugin.getLogger().info("Loaded " + completedQueuePurchases.size() + " completed queue tombstones");
+            plugin.getLogger().fine("Loaded " + completedQueuePurchases.size() + " completed queue tombstones");
         } catch (IOException | RuntimeException failure) {
             plugin.getLogger().log(Level.SEVERE, "Failed to load completed queue tombstones", failure);
             quarantine(completedQueueFile, "malformed completed queue");
@@ -341,20 +341,6 @@ public class QueueManager {
             if (candidate.putIfAbsent(purchaseId, queued) != null) {
                 throw new IllegalArgumentException("queue contains duplicate purchase ID " + purchaseId);
             }
-        }
-        return candidate;
-    }
-
-    private Set<String> validateCompletedPurchases(Set<String> loaded) {
-        Set<String> candidate = new LinkedHashSet<>();
-        if (loaded == null) {
-            throw new IllegalArgumentException("completed queue file must contain a JSON array");
-        }
-        for (String purchaseId : loaded) {
-            if (!isValidPurchaseId(purchaseId)) {
-                throw new IllegalArgumentException("completed queue contains an invalid purchase ID");
-            }
-            candidate.add(purchaseId);
         }
         return candidate;
     }
