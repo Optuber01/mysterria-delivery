@@ -63,7 +63,12 @@ public class PurchaseRequest {
 
             if (node.isTextual()) {
                 return node.asText();
-            } else if (node.isArray() && node.size() >= 6) {
+            } else if (node.isArray() && (node.size() == 6 || node.size() == 7)) {
+                for (JsonNode part : node) {
+                    if (!part.isIntegralNumber() || !part.canConvertToInt()) {
+                        throw new IOException("Invalid entitlement expiry array");
+                    }
+                }
                 int year = node.get(0).asInt();
                 int month = node.get(1).asInt();
                 int day = node.get(2).asInt();
@@ -72,10 +77,13 @@ public class PurchaseRequest {
                 int second = node.get(5).asInt();
                 int nano = node.size() > 6 ? node.get(6).asInt() : 0;
 
-                LocalDateTime dateTime = LocalDateTime.of(year, month, day, hour, minute, second, nano);
-                return dateTime.toString();
+                try {
+                    return LocalDateTime.of(year, month, day, hour, minute, second, nano).toString();
+                } catch (java.time.DateTimeException invalid) {
+                    throw new IOException("Invalid entitlement expiry array", invalid);
+                }
             } else {
-                return null;
+                throw new IOException("Entitlement expiry must be a date string or date array");
             }
         }
     }

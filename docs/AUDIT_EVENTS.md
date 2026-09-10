@@ -47,3 +47,11 @@ require manual reconciliation. The `delivered` event describes effects, not tomb
 
 No command text, payment-provider payload, announcement rendering, or queue polling is
 recorded. Audit calls are guarded and never decide gameplay or API outcomes.
+
+## Entitlement validation
+
+An explicit expiry must be a valid future date; malformed or expired values fail before
+LuckPerms is changed. Invalid date arrays cannot silently become an omitted expiry.
+If expiry is absent, the configured positive day duration (or the existing 30-day default)
+applies. Complete permission lists and nodes are validated before applying any entry;
+mixed or blank values cannot leave an earlier permission partially applied.

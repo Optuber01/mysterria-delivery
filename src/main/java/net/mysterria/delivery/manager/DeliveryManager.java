@@ -11,6 +11,7 @@ import net.mysterria.delivery.MysterriaDelivery;
 import net.mysterria.delivery.audit.DeliveryAuditEmitter;
 import net.mysterria.delivery.config.DeliveryConfig;
 import net.mysterria.delivery.model.DeliveryResponse;
+import net.mysterria.delivery.model.DeliveryMetadata;
 import net.mysterria.delivery.model.PurchaseRequest;
 import net.mysterria.delivery.model.QueuedDelivery;
 import net.mysterria.delivery.model.VoteReward;
@@ -18,8 +19,7 @@ import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
 
 import java.time.Duration;
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
+import java.time.Clock;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -391,12 +391,10 @@ public class DeliveryManager {
 
         CompletableFuture<Void> mutation;
         try {
+            List<Node> nodes = permissions.stream().map(permission -> (Node) PermissionNode.builder(permission)
+                    .value(true).expiry(duration).build()).toList();
             mutation = plugin.getLuckPerms().getUserManager().modifyUser(playerUuid, user -> {
-                for (String permission : permissions) {
-                    Node node = PermissionNode.builder(permission)
-                            .value(true)
-                            .expiry(duration)
-                            .build();
+                for (Node node : nodes) {
                     user.data().add(node);
                 }
             });
@@ -671,49 +669,25 @@ public class DeliveryManager {
         }
     }
 
-    @SuppressWarnings("unchecked")
     private List<String> extractCommands(Map<String, Object> metadata) {
-        Object commands = metadata.get("commands");
-        if (commands instanceof List) {
-            return (List<String>) commands;
-        } else if (commands instanceof String) {
-            return List.of((String) commands);
-        }
-        return new ArrayList<>();
+        return DeliveryMetadata.strings(metadata, "commands");
     }
 
     private String extractGroupName(Map<String, Object> metadata) {
         Object group = metadata.get("group");
-        return group != null ? group.toString() : null;
+        if (group == null) return null;
+        if (!(group instanceof String name) || name.isBlank()) {
+            throw new IllegalArgumentException("group must be a non-blank string");
+        }
+        return name;
     }
 
-    @SuppressWarnings("unchecked")
     private List<String> extractPermissions(Map<String, Object> metadata) {
-        Object permissions = metadata.get("permissions");
-        if (permissions instanceof List) {
-            return (List<String>) permissions;
-        } else if (permissions instanceof String) {
-            return List.of((String) permissions);
-        }
-        return new ArrayList<>();
+        return DeliveryMetadata.strings(metadata, "permissions");
     }
 
     private Duration parseDuration(PurchaseRequest request) {
-        if (request.getExpiresAt() != null) {
-            try {
-                LocalDateTime expiresAt = LocalDateTime.parse(request.getExpiresAt(), DateTimeFormatter.ISO_LOCAL_DATE_TIME);
-                return Duration.between(LocalDateTime.now(), expiresAt);
-            } catch (Exception e) {
-                plugin.getLogger().warning("Failed to parse expiresAt: " + request.getExpiresAt());
-            }
-        }
-
-        Object durationObj = request.getMetadata().get("duration");
-        if (durationObj != null) {
-            return Duration.ofDays(Long.parseLong(durationObj.toString()));
-        }
-
-        return Duration.ofDays(30);
+        return DeliveryMetadata.duration(request, Clock.systemDefaultZone());
     }
 
     private void emitReceived(PurchaseRequest request) {

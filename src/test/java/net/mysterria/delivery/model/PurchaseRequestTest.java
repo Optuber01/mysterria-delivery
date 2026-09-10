@@ -23,4 +23,14 @@ class PurchaseRequestTest {
         assertEquals(Boolean.TRUE, queued.getQueued());
         assertNull(queued.getDeliveredAt());
     }
+
+    @Test void malformedExpiryShapesCannotBecomeAnOmittedExpiry() {
+        for (String value : new String[]{"123", "{}", "[]", "[2026]", "[2026,9,10,0,0,0,0,0]", "[2026,\"9\",10,0,0,0]"}) {
+            assertThrows(java.io.IOException.class, () -> mapper.readValue("{\"expiresAt\":" + value + "}", PurchaseRequest.class));
+        }
+    }
+
+    @Test void backendDateArraysRetainExpiry() throws Exception {
+        assertEquals("2026-09-10T12:30", mapper.readValue("{\"expiresAt\":[2026,9,10,12,30,0]}", PurchaseRequest.class).getExpiresAt());
+    }
 }
