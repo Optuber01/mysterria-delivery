@@ -639,6 +639,9 @@ public class DeliveryManager {
                                                 queued.getRetryCount(), kind, DeliveryAuditDetails.of(request));
                                     }
                                 });
+                    } else if (replayBlockedPurchases.containsKey(queued.getPurchaseId())) {
+                        persistReplayBlockedQueued(queued, player.getUniqueId(), kind,
+                                DeliveryAuditDetails.of(request));
                     } else if (processedPurchases.contains(queued.getPurchaseId())) {
                         plugin.getLogger().severe("Purchase was only partially delivered; automatic retry is disabled: "
                                 + queued.getPurchaseId());
@@ -664,6 +667,9 @@ public class DeliveryManager {
                                                 queued.getRetryCount(), "vote_reward", DeliveryAuditDetails.of(vote));
                                     }
                                 });
+                    } else if (replayBlockedPurchases.containsKey(queued.getPurchaseId())) {
+                        persistReplayBlockedQueued(queued, player.getUniqueId(), "vote_reward",
+                                DeliveryAuditDetails.of(vote));
                     } else {
                         recordQueuedRetry(queued, player.getUniqueId(), "vote_reward");
                     }
@@ -851,6 +857,34 @@ public class DeliveryManager {
                         replayBlockedPurchases.remove(purchaseId, blockedPartial);
                     }
                 });
+    }
+
+    /**
+     * Re-tombstones a queued delivery whose effects ran but whose completion write failed.
+     * The replay-blocked flag records whether the delivery was partial; a full delivery keeps
+     * its plain kind and is reported as recovered when it needed retries.
+     */
+    private void persistReplayBlockedQueued(QueuedDelivery queued, UUID playerId, String kind,
+            Map<String, Object> details) {
+        String purchaseId = queued.getPurchaseId();
+        Boolean blockedPartial = replayBlockedPurchases.get(purchaseId);
+        if (blockedPartial == null) {
+            return;
+        }
+        if (blockedPartial) {
+            plugin.getLogger().severe("Purchase was only partially delivered; automatic retry is disabled: "
+                    + purchaseId);
+        }
+        String deliveryKind = blockedPartial ? "partial_" + kind : kind;
+        persistQueuedCompletion(purchaseId, playerId, deliveryKind).thenAccept(persisted -> {
+            if (!persisted) {
+                return;
+            }
+            replayBlockedPurchases.remove(purchaseId, blockedPartial);
+            if (!blockedPartial && queued.getRetryCount() > 0) {
+                emitRecovered(purchaseId, playerId, queued.getRetryCount(), kind, details);
+            }
+        });
     }
 
     /** Tombstones then dequeues a delivered queue entry; both writes run off the server thread. */
