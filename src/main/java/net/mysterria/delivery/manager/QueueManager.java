@@ -34,10 +34,11 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
 import java.util.logging.Level;
 
@@ -88,11 +89,16 @@ public class QueueManager {
     static final int RECEIVED_ID_LIMIT = 10_000;
     private final File receivedFile;
     private final LinkedHashSet<String> receivedPurchaseIds = new LinkedHashSet<>();
-    private final ExecutorService queueWriter = Executors.newSingleThreadExecutor(task -> {
-        Thread thread = new Thread(task, "mysterria-delivery-queue-writer");
-        thread.setDaemon(true);
-        return thread;
-    });
+    /** Upper bound on pending queue/tombstone writes; a full writer rejects new writes with a false result. */
+    static final int WRITER_CAPACITY = 1024;
+    private final ThreadPoolExecutor queueWriter = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS,
+            new ArrayBlockingQueue<>(WRITER_CAPACITY), task -> {
+                Thread thread = new Thread(task, "mysterria-delivery-queue-writer");
+                thread.setDaemon(true);
+                return thread;
+            }, new ThreadPoolExecutor.AbortPolicy());
+    /** At most one received-ID rewrite is pending; later receipts are folded into that rewrite. */
+    private final AtomicBoolean receivedWritePending = new AtomicBoolean();
 
     public QueueManager(MysterriaDelivery plugin, DeliveryAuditEmitter auditEmitter) {
         this.plugin = plugin;
@@ -238,12 +244,29 @@ public class QueueManager {
                 receivedPurchaseIds.remove(receivedPurchaseIds.iterator().next());
             }
         }
+        scheduleReceivedWrite();
+        return true;
+    }
+
+    /**
+     * Coalesces received-ID rewrites: only one is ever queued, and it snapshots the set when it runs,
+     * so a burst of receipts costs one file rewrite. If the writer is saturated the rewrite is dropped
+     * (audit de-duplication only) and the next receipt schedules it again.
+     */
+    private void scheduleReceivedWrite() {
+        if (!receivedWritePending.compareAndSet(false, true)) {
+            return;
+        }
         writeAsync(() -> {
+            receivedWritePending.set(false);
             synchronized (persistenceLock) {
                 return writeAtomically(receivedFile, new ArrayList<>(receivedPurchaseIds), "received purchase IDs");
             }
+        }).thenAccept(written -> {
+            if (!written) {
+                receivedWritePending.set(false);
+            }
         });
-        return true;
     }
 
     public List<QueuedDelivery> getPlayerQueue(UUID playerUuid) {
@@ -291,8 +314,14 @@ public class QueueManager {
         };
         try {
             queueWriter.execute(task);
-        } catch (RejectedExecutionException shuttingDown) {
-            task.run();
+        } catch (RejectedExecutionException rejected) {
+            if (queueWriter.isShutdown()) {
+                task.run();
+            } else {
+                plugin.getLogger().severe("Queue writer is saturated (" + WRITER_CAPACITY
+                        + " pending writes); rejecting write");
+                result.complete(false);
+            }
         }
         return result;
     }
