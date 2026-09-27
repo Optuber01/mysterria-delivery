@@ -716,6 +716,7 @@ public class DeliveryManager {
      * An online re-post of a queued purchase delivers the queued entry now, through the same
      * claim-guarded path as a join, instead of waiting for the next join. The entry is then
      * tombstoned and dequeued, so neither this re-post nor a later join delivers it twice.
+     * Offline re-posts do nothing, and a retryable failure here never uses up a join retry.
      */
     private void deliverQueuedIfOnline(String purchaseId) {
         QueuedDelivery queued = queueManager.getQueued(purchaseId);
@@ -724,7 +725,11 @@ public class DeliveryManager {
         }
         runOnMain(() -> {
             try {
-                processQueuedDelivery(queued);
+                Player player = Bukkit.getPlayer(queued.getPlayerUuid());
+                if (player == null || !player.isOnline()) {
+                    return;
+                }
+                processQueuedDelivery(queued, false);
             } catch (RuntimeException failure) {
                 plugin.getLogger().log(Level.SEVERE, "Failed to deliver re-posted queued purchase " + purchaseId,
                         failure);
@@ -733,8 +738,13 @@ public class DeliveryManager {
                 "Failed to schedule re-posted queued purchase " + purchaseId, failure));
     }
 
-    /** Main thread only: called from the join listener's scheduled task and for online re-posts. */
+    /** Main thread only: called from the join listener's scheduled task. */
     public void processQueuedDelivery(QueuedDelivery queued) {
+        processQueuedDelivery(queued, true);
+    }
+
+    /** Main thread only. {@code countRetry} is false for online re-posts, which must not consume retries. */
+    private void processQueuedDelivery(QueuedDelivery queued, boolean countRetry) {
         if (queued == null || !isValidPurchaseId(queued.getPurchaseId())) {
             plugin.getLogger().warning("Skipped a queued delivery without a valid purchase ID");
             return;
@@ -765,16 +775,16 @@ public class DeliveryManager {
         }
 
         if (queued.getPurchaseRequest() != null) {
-            deliverQueuedPurchase(queued, recipient);
+            deliverQueuedPurchase(queued, recipient, countRetry);
         } else if (queued.getVoteReward() != null) {
-            deliverQueuedVote(queued, recipient);
+            deliverQueuedVote(queued, recipient, countRetry);
         } else {
             releasePurchase(queued.getPurchaseId());
             plugin.getLogger().warning("Skipped an empty queued delivery: " + queued.getPurchaseId());
         }
     }
 
-    private void deliverQueuedPurchase(QueuedDelivery queued, Recipient recipient) {
+    private void deliverQueuedPurchase(QueuedDelivery queued, Recipient recipient, boolean countRetry) {
         PurchaseRequest request = queued.getPurchaseRequest();
         if (!queued.getPurchaseId().equals(request.getPurchaseId())) {
             releasePurchase(queued.getPurchaseId());
@@ -785,10 +795,10 @@ public class DeliveryManager {
         String kind = purchaseKind(request);
         Map<String, Object> details = DeliveryAuditDetails.of(request);
         deliverItem(recipient, request).thenAccept(response ->
-                handleQueuedOutcome(queued, recipient.id(), kind, details, response));
+                handleQueuedOutcome(queued, recipient.id(), kind, details, response, countRetry));
     }
 
-    private void deliverQueuedVote(QueuedDelivery queued, Recipient recipient) {
+    private void deliverQueuedVote(QueuedDelivery queued, Recipient recipient, boolean countRetry) {
         VoteReward vote = queued.getVoteReward();
         if (!queued.getPurchaseId().equals(vote.getPurchaseId())) {
             releasePurchase(queued.getPurchaseId());
@@ -798,12 +808,12 @@ public class DeliveryManager {
         }
         Map<String, Object> details = DeliveryAuditDetails.of(vote);
         deliverVoteReward(recipient, vote, queued.getRetryCount()).thenAccept(response ->
-                handleQueuedOutcome(queued, recipient.id(), "vote_reward", details, response));
+                handleQueuedOutcome(queued, recipient.id(), "vote_reward", details, response, countRetry));
     }
 
     /** Runs on a completion thread: uses only captured plain values, never Bukkit objects. */
     private void handleQueuedOutcome(QueuedDelivery queued, UUID playerId, String kind, Map<String, Object> details,
-            DeliveryResponse response) {
+            DeliveryResponse response, boolean countRetry) {
         String purchaseId = queued.getPurchaseId();
         if (response.isSuccess()) {
             persistQueuedCompletion(purchaseId, playerId, kind).thenAccept(persisted -> {
@@ -817,7 +827,7 @@ public class DeliveryManager {
             plugin.getLogger().severe("Purchase was only partially delivered; automatic retry is disabled: "
                     + purchaseId);
             persistQueuedCompletion(purchaseId, playerId, "partial_" + kind);
-        } else {
+        } else if (countRetry) {
             recordQueuedRetry(queued, playerId, kind);
         }
     }
