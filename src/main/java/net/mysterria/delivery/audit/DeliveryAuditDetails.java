@@ -14,8 +14,9 @@ import java.util.Map;
 
 /**
  * Builds the entitlement description attached to delivered/recovered/failed rows.
- * Commands are never logged verbatim; only their count and a SHA-256 over the
- * newline-joined command templates are recorded.
+ * These details never carry commands verbatim; only their count and a SHA-256 over the
+ * newline-joined command templates are recorded. The one exception lives outside this
+ * class: a rejected vote command's text is added to its staff-restricted purchase.failed row.
  */
 public final class DeliveryAuditDetails {
     private DeliveryAuditDetails() {}
