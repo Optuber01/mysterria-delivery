@@ -74,6 +74,8 @@ public class DeliveryManager {
         }
         UUID playerUuid = safeUuid(request.getMinecraftUUID());
         if (playerUuid == null) {
+            emitInvalidRequest(request.getPurchaseId(), "invalid_vote_request", "vote_reward",
+                    DeliveryAuditDetails.of(request));
             return CompletableFuture.completedFuture(
                     DeliveryResponse.error(request.getPurchaseId(), "A valid Minecraft UUID is required"));
         }
@@ -766,6 +768,12 @@ public class DeliveryManager {
         auditEmitter.emit("failed", AuditOutcome.FAILED, AuditRisk.HIGH, purchaseId, playerId, metadata);
     }
 
+    /** Rejected before any claim: the purchase id is known, the player is not, so the actor stays null. */
+    private void emitInvalidRequest(String purchaseId, String reason, String deliveryKind,
+                                    Map<String, Object> details) {
+        emitFailed(purchaseId, null, reason, deliveryKind, details);
+    }
+
     private void emitRecovered(String purchaseId, UUID playerId, int retries, String deliveryKind,
                                Map<String, Object> details) {
         Map<String, Object> metadata = auditMetadata(details, deliveryKind, "recovered");
@@ -796,6 +804,8 @@ public class DeliveryManager {
                     "A non-blank purchase ID is required");
         }
         if (safeUuid(request.getMinecraftUuid()) == null) {
+            emitInvalidRequest(request.getPurchaseId(), "invalid_player_uuid", purchaseKind(request),
+                    DeliveryAuditDetails.of(request));
             return DeliveryResponse.error(request.getPurchaseId(), "A valid Minecraft UUID is required");
         }
         return null;
