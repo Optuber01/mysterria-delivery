@@ -70,13 +70,16 @@ public class MysterriaDelivery extends JavaPlugin {
 
     @Override
     public void onDisable() {
+        // Drain queue writes first: their callbacks emit audit rows, so the emitter must still be open.
+        if (queueManager != null) {
+            queueManager.close();
+        }
         if (deliveryManager != null) {
             deliveryManager.close();
         } else if (auditEmitter != null) {
             auditEmitter.close();
         }
         if (queueManager != null) {
-            queueManager.close();
             queueManager.saveQueue();
         }
         getLogger().info("MysterriaDelivery has been disabled!");
