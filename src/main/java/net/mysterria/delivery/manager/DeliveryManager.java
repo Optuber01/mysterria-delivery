@@ -1057,7 +1057,8 @@ public class DeliveryManager {
 
     /**
      * Purchases are dropped from the queue once retries are exhausted; vote rewards stay queued
-     * so later joins keep retrying them. The exhaustion row is emitted once, when the limit is hit.
+     * so later joins keep retrying them. The exhaustion row is emitted once per entry, the first time
+     * the retry count is at or above the limit.
      */
     private void recordQueuedRetry(QueuedDelivery queued, UUID playerId, String deliveryKind) {
         queued.setRetryCount(queued.getRetryCount() + 1);
@@ -1065,7 +1066,9 @@ public class DeliveryManager {
         if (queued.getRetryCount() >= config.getMaxRetries()) {
             plugin.getLogger().severe("Failed to deliver " + deliveryKind + " after " + config.getMaxRetries()
                     + " retries: " + queued.getPurchaseId());
-            boolean firstExhaustion = queued.getRetryCount() == config.getMaxRetries();
+            // A persisted flag, not retryCount == maxRetries: a lowered maxRetries must still yield one row.
+            boolean firstExhaustion = !queued.isExhaustionReported();
+            queued.setExhaustionReported(true);
             if (!retainOnExhaustion) {
                 removeQueued(queued.getPurchaseId(), playerId, deliveryKind).thenAccept(removed -> {
                     if (firstExhaustion) {

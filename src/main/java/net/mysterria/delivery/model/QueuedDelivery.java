@@ -23,6 +23,8 @@ public class QueuedDelivery {
     private int retryCount;
     /** Number of backend re-posts received while this purchase was already queued. */
     private int repostCount;
+    /** Set once purchase.retries-exhausted has been emitted, so it is emitted exactly once per entry. */
+    private boolean exhaustionReported;
 
     public QueuedDelivery(String purchaseId, UUID playerUuid, String playerName, LocalDateTime queuedAt, int retryCount, PurchaseRequest purchaseRequest) {
         this.purchaseId = purchaseId;
