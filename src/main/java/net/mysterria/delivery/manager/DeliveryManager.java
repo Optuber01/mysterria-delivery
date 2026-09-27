@@ -37,8 +37,8 @@ public class DeliveryManager {
     private final QueueManager queueManager;
     private final Set<String> processedPurchases = ConcurrentHashMap.newKeySet();
     private final Set<String> inFlightPurchases = ConcurrentHashMap.newKeySet();
-    /** Purchases whose effects ran but whose completion tombstone could not be saved. */
-    private final Set<String> replayBlockedPurchases = ConcurrentHashMap.newKeySet();
+    /** Purchases whose effects ran but whose completion tombstone could not be saved; value = partial. */
+    private final Map<String, Boolean> replayBlockedPurchases = new ConcurrentHashMap<>();
     private final MiniMessage miniMessage = MiniMessage.miniMessage();
     private DeliveryConfig config;
     private final DeliveryAuditEmitter auditEmitter;
@@ -457,25 +457,25 @@ public class DeliveryManager {
                             inFlightPurchases.remove(purchaseId);
                             persisted.complete(response);
                         } else {
-                            persisted.complete(completionFailure(purchaseId, playerId, kind));
+                            persisted.complete(completionFailure(purchaseId, playerId, kind, !response.isSuccess()));
                         }
                     } catch (RuntimeException failure) {
-                        persisted.complete(completionFailure(purchaseId, playerId, kind));
+                        persisted.complete(completionFailure(purchaseId, playerId, kind, !response.isSuccess()));
                     }
                 });
             } catch (RejectedExecutionException failure) {
-                persisted.complete(completionFailure(purchaseId, playerId, kind));
+                persisted.complete(completionFailure(purchaseId, playerId, kind, !response.isSuccess()));
             }
             return persisted;
         });
     }
 
-    private DeliveryResponse completionFailure(String purchaseId, UUID playerId, String kind) {
+    private DeliveryResponse completionFailure(String purchaseId, UUID playerId, String kind, boolean partial) {
         auditEmitter.emit("completion-persistence-failed", AuditOutcome.FAILED, AuditRisk.HIGH,
                 purchaseId, playerId, Map.of("delivery_kind", kind,
                         "reason", "completion_tombstone_not_persisted", "requires_reconciliation", true));
         // Effects already ran: later re-posts must see replay_blocked, never in_progress.
-        replayBlockedPurchases.add(purchaseId);
+        replayBlockedPurchases.put(purchaseId, partial);
         inFlightPurchases.remove(purchaseId);
         return DeliveryResponse.error(purchaseId,
                 "Delivery effects occurred but replay protection could not be saved; reconciliation required");
@@ -614,7 +614,7 @@ public class DeliveryManager {
         if (player != null && player.isOnline()) {
             ClaimResult claim = claimPurchase(queued.getPurchaseId());
             if (claim == ClaimResult.ALREADY_PROCESSED) {
-                persistQueuedCompletion(queued.getPurchaseId(), player.getUniqueId(), "queued_purchase");
+                persistAlreadyProcessedQueued(queued.getPurchaseId(), player.getUniqueId());
                 return;
             }
             if (claim == ClaimResult.IN_PROGRESS) {
@@ -785,7 +785,7 @@ public class DeliveryManager {
         if (!queueManager.isReplayGuardAvailable()) {
             return ClaimResult.REPLAY_GUARD_UNAVAILABLE;
         }
-        if (replayBlockedPurchases.contains(purchaseId)) {
+        if (replayBlockedPurchases.containsKey(purchaseId)) {
             return ClaimResult.ALREADY_PROCESSED;
         }
         if (!inFlightPurchases.add(purchaseId)) {
@@ -837,6 +837,20 @@ public class DeliveryManager {
                 Map.of("delivery_kind", deliveryKind,
                         "reason", "queue_cleanup_persistence_failed",
                         "state", "delivered_queue_retained"));
+    }
+
+    /** Re-tombstones an already-processed queue entry, keeping the partial state of a replay-blocked delivery. */
+    private void persistAlreadyProcessedQueued(String purchaseId, UUID playerId) {
+        Boolean blockedPartial = replayBlockedPurchases.get(purchaseId);
+        boolean partial = blockedPartial != null
+                ? blockedPartial
+                : queueManager.completionState(purchaseId) == CompletionHistory.State.PARTIAL;
+        persistQueuedCompletion(purchaseId, playerId, partial ? "partial_queued_purchase" : "queued_purchase")
+                .thenAccept(persisted -> {
+                    if (persisted && blockedPartial != null) {
+                        replayBlockedPurchases.remove(purchaseId, blockedPartial);
+                    }
+                });
     }
 
     /** Tombstones then dequeues a delivered queue entry; both writes run off the server thread. */
