@@ -106,7 +106,7 @@ public class DeliveryManager {
             );
         }
         return deliverOrQueue(playerUuid, request.getPurchaseId(), "vote_reward", DeliveryAuditDetails.of(request),
-                recipient -> result -> dispatchVoteReward(recipient, request, result),
+                recipient -> result -> dispatchVoteReward(recipient, request, 0, result),
                 () -> queueManager.queueDeliveryAsync(request));
     }
 
@@ -281,17 +281,24 @@ public class DeliveryManager {
         result.complete(DeliveryResponse.error(purchaseId, message));
     }
 
-    private CompletableFuture<DeliveryResponse> deliverVoteReward(Recipient recipient, VoteReward request) {
+    private CompletableFuture<DeliveryResponse> deliverVoteReward(Recipient recipient, VoteReward request,
+            int retryCount) {
         CompletableFuture<DeliveryResponse> result = new CompletableFuture<>();
         Map<String, Object> details = DeliveryAuditDetails.of(request);
-        runOnMain(() -> dispatchVoteReward(recipient, request, result),
+        runOnMain(() -> dispatchVoteReward(recipient, request, retryCount, result),
                 failure -> preDispatchFailure(request.getPurchaseId(), recipient.id(), "vote_reward", details,
                         "scheduling_failed", failure, result));
         return persistCompletion(result, request.getPurchaseId(), recipient.id(), "vote_reward", details);
     }
 
-    /** Main thread only. */
-    private void dispatchVoteReward(Recipient recipient, VoteReward request, CompletableFuture<DeliveryResponse> result) {
+    /**
+     * Main thread only. Retry rule for the single vote command: a clean {@code false} return means
+     * nothing was dispatched, so the claim is released and the vote stays retryable (a queued vote
+     * is retried on a later join). A thrown command may have applied effects part-way, so it is
+     * tombstoned PARTIAL through {@link #dispatchFailed} and never retried automatically.
+     */
+    private void dispatchVoteReward(Recipient recipient, VoteReward request, int retryCount,
+            CompletableFuture<DeliveryResponse> result) {
         String purchaseId = request.getPurchaseId();
         Map<String, Object> details = DeliveryAuditDetails.of(request);
         String command = request.getCommand();
@@ -312,13 +319,23 @@ public class DeliveryManager {
             return;
         }
         if (!accepted) {
-            dispatchFailed(purchaseId, recipient.id(), "vote_reward", details, "command_rejected", 1, 0,
-                    "Delivery command was rejected", result);
+            voteCommandRejected(purchaseId, recipient.id(), details, command, retryCount, result);
             return;
         }
         completePurchase(purchaseId);
         result.complete(DeliveryResponse.success(purchaseId, "Item delivered successfully"));
         announceVoteDelivery(recipient, request);
+    }
+
+    /** Nothing was dispatched: release the claim so the vote reward stays retryable. */
+    private void voteCommandRejected(String purchaseId, UUID playerId, Map<String, Object> details, String command,
+            int retryCount, CompletableFuture<DeliveryResponse> result) {
+        releasePurchase(purchaseId);
+        Map<String, Object> metadata = new LinkedHashMap<>(details);
+        metadata.put("command", command);
+        metadata.put("retry_count", retryCount);
+        emitFailed(purchaseId, playerId, "command_rejected", "vote_reward", metadata);
+        result.complete(DeliveryResponse.error(purchaseId, "Delivery command was rejected"));
     }
 
     private CompletableFuture<DeliveryResponse> deliverItem(Recipient recipient, PurchaseRequest request) {
@@ -740,7 +757,7 @@ public class DeliveryManager {
             return;
         }
         Map<String, Object> details = DeliveryAuditDetails.of(vote);
-        deliverVoteReward(recipient, vote).thenAccept(response ->
+        deliverVoteReward(recipient, vote, queued.getRetryCount()).thenAccept(response ->
                 handleQueuedOutcome(queued, recipient.id(), "vote_reward", details, response));
     }
 
