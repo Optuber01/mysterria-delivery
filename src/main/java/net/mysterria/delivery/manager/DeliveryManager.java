@@ -46,6 +46,8 @@ public class DeliveryManager {
     private DeliveryConfig config;
     private final DeliveryAuditEmitter auditEmitter;
     private final ThreadPoolExecutor completionWriter;
+    private static final String RECONCILIATION_REQUIRED =
+            "Delivery effects occurred but replay protection could not be saved; reconciliation required";
 
     public DeliveryManager(MysterriaDelivery plugin, DeliveryConfig config, QueueManager queueManager) {
         this.plugin = plugin;
@@ -539,8 +541,19 @@ public class DeliveryManager {
             boolean partial = !response.isSuccess();
             CompletableFuture<DeliveryResponse> persisted = new CompletableFuture<>();
             try {
-                completionWriter.execute(() -> persisted.complete(
-                        writeCompletion(response, purchaseId, playerId, kind, details)));
+                completionWriter.execute(() -> {
+                    try {
+                        persisted.complete(writeCompletion(response, purchaseId, playerId, kind, details));
+                    } catch (RuntimeException | Error failure) {
+                        // Never leave the caller's response hanging on an unexpected writer failure.
+                        plugin.getLogger().log(Level.SEVERE, "Completion write failed for " + purchaseId, failure);
+                        // The purchase stays claimed, so re-posts see in_progress rather than redelivering.
+                        persisted.complete(DeliveryResponse.error(purchaseId, RECONCILIATION_REQUIRED));
+                        if (failure instanceof Error error) {
+                            throw error;
+                        }
+                    }
+                });
             } catch (RejectedExecutionException failure) {
                 persisted.complete(completionFailure(purchaseId, playerId, kind, partial, details));
             }
@@ -562,7 +575,12 @@ public class DeliveryManager {
         }
         inFlightPurchases.remove(purchaseId);
         if (!partial) {
-            emitDelivered(purchaseId, playerId, kind, details);
+            try {
+                emitDelivered(purchaseId, playerId, kind, details);
+            } catch (RuntimeException | LinkageError failure) {
+                // The tombstone is saved; an audit failure must not change or hang the response.
+                plugin.getLogger().log(Level.WARNING, "Failed to audit delivery of " + purchaseId, failure);
+            }
         }
         return response;
     }
@@ -581,8 +599,7 @@ public class DeliveryManager {
         // Effects already ran: later re-posts must see replay_blocked, never in_progress.
         replayBlockedPurchases.put(purchaseId, partial);
         inFlightPurchases.remove(purchaseId);
-        return DeliveryResponse.error(purchaseId,
-                "Delivery effects occurred but replay protection could not be saved; reconciliation required");
+        return DeliveryResponse.error(purchaseId, RECONCILIATION_REQUIRED);
     }
 
     public void close() {
