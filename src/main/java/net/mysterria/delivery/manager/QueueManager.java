@@ -205,16 +205,33 @@ public class QueueManager {
     }
 
     /**
+     * Returns true when the purchase is already queued, bumping its silent re-post counter.
+     * Lets callers acknowledge an online re-post without delivering the queued entry again.
+     */
+    public boolean recordRepostIfQueued(String purchaseId) {
+        if (!isValidPurchaseId(purchaseId)) {
+            return false;
+        }
+        QueuedDelivery existing = queue.get(purchaseId);
+        if (existing == null) {
+            return false;
+        }
+        existing.setRepostCount(existing.getRepostCount() + 1);
+        return true;
+    }
+
+    /**
      * Records that a purchase receipt is being audited. Returns false when this purchase ID
-     * was already seen, so callers emit purchase.received at most once per ID. The bounded
-     * seen-set is persisted next to the queue file.
+     * was already seen, so callers emit purchase.received at most once per ID. A queued
+     * purchase counts as seen even if it has aged out of the bounded seen-set, which is
+     * persisted next to the queue file.
      */
     public boolean markReceived(String purchaseId) {
         if (!isValidPurchaseId(purchaseId)) {
             return false;
         }
         synchronized (persistenceLock) {
-            if (!receivedPurchaseIds.add(purchaseId)) {
+            if (queue.containsKey(purchaseId) || !receivedPurchaseIds.add(purchaseId)) {
                 return false;
             }
             while (receivedPurchaseIds.size() > RECEIVED_ID_LIMIT) {
@@ -311,6 +328,8 @@ public class QueueManager {
             loadPendingQueueLocked();
             loadCompletedQueueLocked();
             loadReceivedLocked();
+            // Queued purchases were received before they were queued; never re-audit their receipt.
+            receivedPurchaseIds.addAll(queue.keySet());
         }
     }
 

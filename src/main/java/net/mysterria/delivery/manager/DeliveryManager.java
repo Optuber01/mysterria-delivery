@@ -79,6 +79,10 @@ public class DeliveryManager {
             return CompletableFuture.completedFuture(
                     DeliveryResponse.error(request.getPurchaseId(), "A valid Minecraft UUID is required"));
         }
+        if (queueManager.recordRepostIfQueued(request.getPurchaseId())) {
+            return CompletableFuture.completedFuture(
+                    queueResponse(request.getPurchaseId(), QueueManager.QueueResult.ALREADY_QUEUED));
+        }
         emitReceived(request);
         ClaimResult claim = claimPurchase(request.getPurchaseId());
         if (claim != ClaimResult.CLAIMED) {
@@ -116,6 +120,11 @@ public class DeliveryManager {
         DeliveryResponse validationFailure = validatePurchaseRequest(request);
         if (validationFailure != null) {
             return CompletableFuture.completedFuture(validationFailure);
+        }
+        // An online re-post of a queued purchase must not deliver it a second time.
+        if (queueManager.recordRepostIfQueued(request.getPurchaseId())) {
+            return CompletableFuture.completedFuture(
+                    queueResponse(request.getPurchaseId(), QueueManager.QueueResult.ALREADY_QUEUED));
         }
         emitReceived(request);
         ClaimResult claim = claimPurchase(request.getPurchaseId());
