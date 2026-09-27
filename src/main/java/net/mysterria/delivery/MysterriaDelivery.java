@@ -76,6 +76,7 @@ public class MysterriaDelivery extends JavaPlugin {
             auditEmitter.close();
         }
         if (queueManager != null) {
+            queueManager.close();
             queueManager.saveQueue();
         }
         getLogger().info("MysterriaDelivery has been disabled!");

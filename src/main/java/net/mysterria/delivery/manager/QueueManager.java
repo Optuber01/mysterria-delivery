@@ -9,6 +9,7 @@ import com.google.gson.stream.JsonWriter;
 import dev.ua.ikeepcalm.mysterria.audit.client.api.AuditOutcome;
 import dev.ua.ikeepcalm.mysterria.audit.client.api.AuditRisk;
 import net.mysterria.delivery.MysterriaDelivery;
+import net.mysterria.delivery.audit.DeliveryAuditDetails;
 import net.mysterria.delivery.audit.DeliveryAuditEmitter;
 import net.mysterria.delivery.model.PurchaseRequest;
 import net.mysterria.delivery.model.QueuedDelivery;
@@ -25,13 +26,19 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
-
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
-
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
 import java.util.logging.Level;
 
 public class QueueManager {
@@ -77,6 +84,15 @@ public class QueueManager {
     private boolean queuePersistenceBlocked;
     private boolean completedQueuePersistenceBlocked;
     private volatile boolean replayGuardAvailable = true;
+    /** Bounded, insertion-ordered set of purchase IDs whose receipt has already been audited. */
+    static final int RECEIVED_ID_LIMIT = 10_000;
+    private final File receivedFile;
+    private final LinkedHashSet<String> receivedPurchaseIds = new LinkedHashSet<>();
+    private final ExecutorService queueWriter = Executors.newSingleThreadExecutor(task -> {
+        Thread thread = new Thread(task, "mysterria-delivery-queue-writer");
+        thread.setDaemon(true);
+        return thread;
+    });
 
     public QueueManager(MysterriaDelivery plugin, DeliveryAuditEmitter auditEmitter) {
         this.plugin = plugin;
@@ -84,6 +100,7 @@ public class QueueManager {
         this.queueFile = new File(plugin.getDataFolder(), "queue.json");
         this.completedQueueFile = new File(plugin.getDataFolder(), "completed-queue.json");
         this.completedQueueBlockedFile = new File(plugin.getDataFolder(), "completed-queue.blocked");
+        this.receivedFile = new File(plugin.getDataFolder(), "received-purchases.json");
     }
 
     public QueueResult queueDelivery(VoteReward request) {
@@ -100,7 +117,8 @@ public class QueueManager {
 
         synchronized (persistenceLock) {
             if (!replayGuardAvailable) {
-                emitPersistenceFailure(request.getPurchaseId(), playerUuid, "vote_reward");
+                emitPersistenceFailure(request.getPurchaseId(), playerUuid, "vote_reward",
+                        DeliveryAuditDetails.of(request));
                 return QueueResult.PERSISTENCE_FAILED;
             }
             if (completedQueuePurchases.containsKey(request.getPurchaseId())) {
@@ -109,15 +127,13 @@ public class QueueManager {
                         Map.of("delivery_kind", "vote_reward", "state", "replay_blocked"));
                 return QueueResult.ALREADY_COMPLETED;
             }
-            if (queue.putIfAbsent(request.getPurchaseId(), queued) != null) {
-                auditEmitter.emit("duplicate-rejected", AuditOutcome.DENIED, AuditRisk.NORMAL,
-                        request.getPurchaseId(), playerUuid,
-                        Map.of("delivery_kind", "vote_reward", "state", "already_queued"));
+            if (recordRepost(request.getPurchaseId(), queued)) {
                 return QueueResult.ALREADY_QUEUED;
             }
             if (!saveQueueLocked()) {
                 queue.remove(request.getPurchaseId(), queued);
-                emitPersistenceFailure(request.getPurchaseId(), playerUuid, "vote_reward");
+                emitPersistenceFailure(request.getPurchaseId(), playerUuid, "vote_reward",
+                        DeliveryAuditDetails.of(request));
                 return QueueResult.PERSISTENCE_FAILED;
             }
         }
@@ -144,7 +160,8 @@ public class QueueManager {
 
         synchronized (persistenceLock) {
             if (!replayGuardAvailable) {
-                emitPersistenceFailure(request.getPurchaseId(), playerUuid, "purchase");
+                emitPersistenceFailure(request.getPurchaseId(), playerUuid, "purchase",
+                        DeliveryAuditDetails.of(request));
                 return QueueResult.PERSISTENCE_FAILED;
             }
             if (completedQueuePurchases.containsKey(request.getPurchaseId())) {
@@ -153,17 +170,13 @@ public class QueueManager {
                         Map.of("delivery_kind", "purchase", "state", "replay_blocked"));
                 return QueueResult.ALREADY_COMPLETED;
             }
-            if (queue.putIfAbsent(request.getPurchaseId(), queued) != null) {
-                auditEmitter.emit("duplicate-rejected", AuditOutcome.DENIED, AuditRisk.NORMAL,
-                        request.getPurchaseId(), playerUuid,
-                        Map.of("delivery_kind", "purchase", "service_name",
-                                request.getServiceName() == null ? "" : request.getServiceName(),
-                                "state", "already_queued"));
+            if (recordRepost(request.getPurchaseId(), queued)) {
                 return QueueResult.ALREADY_QUEUED;
             }
             if (!saveQueueLocked()) {
                 queue.remove(request.getPurchaseId(), queued);
-                emitPersistenceFailure(request.getPurchaseId(), playerUuid, "purchase");
+                emitPersistenceFailure(request.getPurchaseId(), playerUuid, "purchase",
+                        DeliveryAuditDetails.of(request));
                 return QueueResult.PERSISTENCE_FAILED;
             }
         }
@@ -176,6 +189,44 @@ public class QueueManager {
 
         plugin.getLogger().fine("Queued delivery for offline player: " + request.getNickname());
         return QueueResult.QUEUED;
+    }
+
+    /**
+     * Returns true when the purchase is already queued. Re-posts are silent: only an
+     * in-memory counter on the queue entry is bumped (persisted with the next queue save).
+     */
+    private boolean recordRepost(String purchaseId, QueuedDelivery candidate) {
+        QueuedDelivery existing = queue.putIfAbsent(purchaseId, candidate);
+        if (existing == null) {
+            return false;
+        }
+        existing.setRepostCount(existing.getRepostCount() + 1);
+        return true;
+    }
+
+    /**
+     * Records that a purchase receipt is being audited. Returns false when this purchase ID
+     * was already seen, so callers emit purchase.received at most once per ID. The bounded
+     * seen-set is persisted next to the queue file.
+     */
+    public boolean markReceived(String purchaseId) {
+        if (!isValidPurchaseId(purchaseId)) {
+            return false;
+        }
+        synchronized (persistenceLock) {
+            if (!receivedPurchaseIds.add(purchaseId)) {
+                return false;
+            }
+            while (receivedPurchaseIds.size() > RECEIVED_ID_LIMIT) {
+                receivedPurchaseIds.remove(receivedPurchaseIds.iterator().next());
+            }
+        }
+        writeAsync(() -> {
+            synchronized (persistenceLock) {
+                return writeAtomically(receivedFile, new ArrayList<>(receivedPurchaseIds), "received purchase IDs");
+            }
+        });
+        return true;
     }
 
     public List<QueuedDelivery> getPlayerQueue(UUID playerUuid) {
@@ -198,6 +249,49 @@ public class QueueManager {
         }
     }
 
+    public CompletableFuture<Boolean> removeFromQueueAsync(String purchaseId) {
+        return writeAsync(() -> removeFromQueue(purchaseId));
+    }
+
+    public CompletableFuture<Boolean> markCompletedAsync(String purchaseId, boolean partial) {
+        return writeAsync(() -> markCompleted(purchaseId, partial));
+    }
+
+    public CompletableFuture<Boolean> saveQueueAsync() {
+        return writeAsync(this::saveQueue);
+    }
+
+    /** Runs a queue/tombstone write on the single FIFO writer thread; each write still takes persistenceLock. */
+    private CompletableFuture<Boolean> writeAsync(BooleanSupplier write) {
+        CompletableFuture<Boolean> result = new CompletableFuture<>();
+        Runnable task = () -> {
+            try {
+                result.complete(write.getAsBoolean());
+            } catch (RuntimeException failure) {
+                plugin.getLogger().log(Level.SEVERE, "Queue write failed", failure);
+                result.complete(false);
+            }
+        };
+        try {
+            queueWriter.execute(task);
+        } catch (RejectedExecutionException shuttingDown) {
+            task.run();
+        }
+        return result;
+    }
+
+    /** Drains pending queue writes during plugin shutdown. */
+    public void close() {
+        queueWriter.shutdown();
+        try {
+            if (!queueWriter.awaitTermination(5, TimeUnit.SECONDS)) {
+                plugin.getLogger().severe("Timed out waiting for pending queue writes");
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     public boolean saveQueue() {
         synchronized (persistenceLock) {
             return saveQueueLocked();
@@ -216,6 +310,24 @@ public class QueueManager {
         synchronized (persistenceLock) {
             loadPendingQueueLocked();
             loadCompletedQueueLocked();
+            loadReceivedLocked();
+        }
+    }
+
+    private void loadReceivedLocked() {
+        receivedPurchaseIds.clear();
+        if (!receivedFile.exists()) {
+            return;
+        }
+        try (Reader reader = Files.newBufferedReader(receivedFile.toPath(), StandardCharsets.UTF_8)) {
+            List<String> loaded = gson.fromJson(reader, new TypeToken<List<String>>() {
+            }.getType());
+            if (loaded != null) {
+                loaded.stream().filter(this::isValidPurchaseId).forEach(receivedPurchaseIds::add);
+            }
+        } catch (IOException | RuntimeException failure) {
+            // Audit de-duplication only; never blocks deliveries.
+            plugin.getLogger().log(Level.WARNING, "Failed to load received purchase IDs", failure);
         }
     }
 
@@ -402,11 +514,12 @@ public class QueueManager {
         return purchaseId != null && !purchaseId.isBlank();
     }
 
-    private void emitPersistenceFailure(String purchaseId, UUID playerUuid, String deliveryKind) {
-        auditEmitter.emit("failed", AuditOutcome.FAILED, AuditRisk.HIGH,
-                purchaseId, playerUuid,
-                Map.of("delivery_kind", deliveryKind,
-                        "reason", "queue_persistence_failed",
-                        "state", "queue_failed"));
+    private void emitPersistenceFailure(String purchaseId, UUID playerUuid, String deliveryKind,
+                                        Map<String, Object> details) {
+        Map<String, Object> metadata = new LinkedHashMap<>(details);
+        metadata.put("delivery_kind", deliveryKind);
+        metadata.put("reason", "queue_persistence_failed");
+        metadata.put("state", "queue_failed");
+        auditEmitter.emit("failed", AuditOutcome.FAILED, AuditRisk.HIGH, purchaseId, playerUuid, metadata);
     }
 }
