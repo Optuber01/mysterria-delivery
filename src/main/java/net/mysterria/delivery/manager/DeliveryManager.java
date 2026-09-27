@@ -549,8 +549,7 @@ public class DeliveryManager {
                     } catch (RuntimeException | Error failure) {
                         // Never leave the caller's response hanging on an unexpected writer failure.
                         plugin.getLogger().log(Level.SEVERE, "Completion write failed for " + purchaseId, failure);
-                        // The purchase stays claimed, so re-posts see in_progress rather than redelivering.
-                        persisted.complete(DeliveryResponse.error(purchaseId, RECONCILIATION_REQUIRED));
+                        persisted.complete(unexpectedCompletionFailure(purchaseId, playerId, kind, partial, details));
                         if (failure instanceof Error error) {
                             throw error;
                         }
@@ -585,6 +584,20 @@ public class DeliveryManager {
             }
         }
         return response;
+    }
+
+    /** Audits and replay-blocks the purchase like any unpersisted completion; never throws. */
+    private DeliveryResponse unexpectedCompletionFailure(String purchaseId, UUID playerId, String kind,
+            boolean partial, Map<String, Object> details) {
+        try {
+            return completionFailure(purchaseId, playerId, kind, partial, details);
+        } catch (RuntimeException | LinkageError auditFailure) {
+            plugin.getLogger().log(Level.SEVERE, "Failed to audit completion failure of " + purchaseId, auditFailure);
+            // Effects already ran: later re-posts must see replay_blocked, never redeliver.
+            replayBlockedPurchases.put(purchaseId, partial);
+            inFlightPurchases.remove(purchaseId);
+            return DeliveryResponse.error(purchaseId, RECONCILIATION_REQUIRED);
+        }
     }
 
     private DeliveryResponse completionFailure(String purchaseId, UUID playerId, String kind, boolean partial,
