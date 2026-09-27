@@ -205,8 +205,6 @@ public class DeliveryManager {
                         return;
                     }
                     completePurchase(request.getPurchaseId());
-                    emitDelivered(request.getPurchaseId(), player.getUniqueId(), "vote_reward",
-                            DeliveryAuditDetails.of(request));
                     result.complete(DeliveryResponse.success(request.getPurchaseId(), "Item delivered successfully"));
                     announceVoteDelivery(player, request);
                 } catch (RuntimeException failure) {
@@ -226,7 +224,8 @@ public class DeliveryManager {
             result.complete(DeliveryResponse.error(request.getPurchaseId(),
                     "Delivery failed: " + failure.getMessage()));
         }
-        return persistCompletion(result, request.getPurchaseId(), player.getUniqueId(), "vote_reward");
+        return persistCompletion(result, request.getPurchaseId(), player.getUniqueId(), "vote_reward",
+                DeliveryAuditDetails.of(request));
     }
 
     private CompletableFuture<DeliveryResponse> deliverItem(Player player, PurchaseRequest request) {
@@ -297,7 +296,6 @@ public class DeliveryManager {
                     }
 
                     completePurchase(request.getPurchaseId());
-                    emitDelivered(request.getPurchaseId(), player.getUniqueId(), kind, details);
                     result.complete(DeliveryResponse.success(request.getPurchaseId(), "Item delivered successfully"));
                     announcePurchaseDelivery(player, request);
                 } catch (RuntimeException failure) {
@@ -323,7 +321,7 @@ public class DeliveryManager {
             result.complete(DeliveryResponse.error(request.getPurchaseId(),
                     "Delivery failed: " + failure.getMessage()));
         }
-        return persistCompletion(result, request.getPurchaseId(), player.getUniqueId(), kind);
+        return persistCompletion(result, request.getPurchaseId(), player.getUniqueId(), kind, details);
     }
 
     private CompletableFuture<DeliveryResponse> deliverSubscription(UUID playerUuid, PurchaseRequest request) {
@@ -372,14 +370,13 @@ public class DeliveryManager {
             }
 
             completePurchase(request.getPurchaseId());
-            emitDelivered(request.getPurchaseId(), playerUuid, "subscription", details);
             plugin.getLogger().fine("Granted subscription " + groupName + " to " + playerUuid + " for " + duration);
 
             schedulePurchaseAnnouncement(playerUuid, request);
 
             return DeliveryResponse.success(request.getPurchaseId(), "Subscription granted successfully");
         });
-        return persistCompletion(result, request.getPurchaseId(), playerUuid, "subscription");
+        return persistCompletion(result, request.getPurchaseId(), playerUuid, "subscription", details);
     }
 
     private CompletableFuture<DeliveryResponse> deliverPermission(UUID playerUuid, PurchaseRequest request) {
@@ -429,51 +426,68 @@ public class DeliveryManager {
             }
 
             completePurchase(request.getPurchaseId());
-            emitDelivered(request.getPurchaseId(), playerUuid, "permission", details);
             plugin.getLogger().fine("Granted permissions " + permissions + " to " + playerUuid + " for " + duration);
 
             schedulePurchaseAnnouncement(playerUuid, request);
 
             return DeliveryResponse.success(request.getPurchaseId(), "Permissions granted successfully");
         });
-        return persistCompletion(result, request.getPurchaseId(), playerUuid, "permission");
+        return persistCompletion(result, request.getPurchaseId(), playerUuid, "permission", details);
     }
 
     /** Persist both online and queued outcomes before acknowledging them to the caller.
      * Commands and storage cannot form an atomic transaction: a crash between them
      * still requires reconciliation. Partial grants are also tombstoned, never retried.
+     * purchase.delivered COMMITTED is only emitted once the completion tombstone is saved.
      */
     private CompletableFuture<DeliveryResponse> persistCompletion(CompletableFuture<DeliveryResponse> delivery,
-            String purchaseId, UUID playerId, String kind) {
+            String purchaseId, UUID playerId, String kind, Map<String, Object> details) {
         return delivery.thenCompose(response -> {
             if (!processedPurchases.contains(purchaseId)) {
                 return CompletableFuture.completedFuture(response);
             }
+            boolean partial = !response.isSuccess();
             CompletableFuture<DeliveryResponse> persisted = new CompletableFuture<>();
             try {
-                completionWriter.execute(() -> {
-                    try {
-                        if (queueManager.markCompleted(purchaseId, !response.isSuccess())) {
-                            inFlightPurchases.remove(purchaseId);
-                            persisted.complete(response);
-                        } else {
-                            persisted.complete(completionFailure(purchaseId, playerId, kind, !response.isSuccess()));
-                        }
-                    } catch (RuntimeException failure) {
-                        persisted.complete(completionFailure(purchaseId, playerId, kind, !response.isSuccess()));
-                    }
-                });
+                completionWriter.execute(() -> persisted.complete(
+                        writeCompletion(response, purchaseId, playerId, kind, details)));
             } catch (RejectedExecutionException failure) {
-                persisted.complete(completionFailure(purchaseId, playerId, kind, !response.isSuccess()));
+                persisted.complete(completionFailure(purchaseId, playerId, kind, partial, details));
             }
             return persisted;
         });
     }
 
-    private DeliveryResponse completionFailure(String purchaseId, UUID playerId, String kind, boolean partial) {
+    private DeliveryResponse writeCompletion(DeliveryResponse response, String purchaseId, UUID playerId,
+            String kind, Map<String, Object> details) {
+        boolean partial = !response.isSuccess();
+        boolean marked;
+        try {
+            marked = queueManager.markCompleted(purchaseId, partial);
+        } catch (RuntimeException failure) {
+            marked = false;
+        }
+        if (!marked) {
+            return completionFailure(purchaseId, playerId, kind, partial, details);
+        }
+        inFlightPurchases.remove(purchaseId);
+        if (!partial) {
+            emitDelivered(purchaseId, playerId, kind, details);
+        }
+        return response;
+    }
+
+    private DeliveryResponse completionFailure(String purchaseId, UUID playerId, String kind, boolean partial,
+            Map<String, Object> details) {
         auditEmitter.emit("completion-persistence-failed", AuditOutcome.FAILED, AuditRisk.HIGH,
                 purchaseId, playerId, Map.of("delivery_kind", kind,
                         "reason", "completion_tombstone_not_persisted", "requires_reconciliation", true));
+        if (!partial) {
+            Map<String, Object> metadata = auditMetadata(details, kind, "delivered_unpersisted");
+            metadata.put("reason", "completion_unpersisted");
+            metadata.put("requires_reconciliation", true);
+            auditEmitter.emit("delivered", AuditOutcome.FAILED, AuditRisk.HIGH, purchaseId, playerId, metadata);
+        }
         // Effects already ran: later re-posts must see replay_blocked, never in_progress.
         replayBlockedPurchases.put(purchaseId, partial);
         inFlightPurchases.remove(purchaseId);
