@@ -153,14 +153,24 @@ public class QueueManager {
         return QueueResult.QUEUED;
     }
 
-    /** Queues a purchase on the writer thread so the disk write never runs on the server thread. */
+    /**
+     * Queues a purchase on the writer thread so the disk write never runs on the server thread.
+     * A saturated writer rejects the purchase with its own purchase.failed row.
+     */
     public CompletableFuture<QueueResult> queueDeliveryAsync(PurchaseRequest request) {
-        return submitAsync(() -> queueDelivery(request), QueueResult.PERSISTENCE_FAILED);
+        return submitAsync(() -> queueDelivery(request), QueueResult.PERSISTENCE_FAILED,
+                () -> emitWriterSaturated(request.getPurchaseId(), request.getMinecraftUuid(), "purchase",
+                        DeliveryAuditDetails.of(request)));
     }
 
-    /** Queues a vote reward on the writer thread so the disk write never runs on the server thread. */
+    /**
+     * Queues a vote reward on the writer thread so the disk write never runs on the server thread.
+     * A saturated writer rejects the vote with its own purchase.failed row.
+     */
     public CompletableFuture<QueueResult> queueDeliveryAsync(VoteReward request) {
-        return submitAsync(() -> queueDelivery(request), QueueResult.PERSISTENCE_FAILED);
+        return submitAsync(() -> queueDelivery(request), QueueResult.PERSISTENCE_FAILED,
+                () -> emitWriterSaturated(request.getPurchaseId(), request.getMinecraftUUID(), "vote_reward",
+                        DeliveryAuditDetails.of(request)));
     }
 
     public QueueResult queueDelivery(PurchaseRequest request) {
@@ -318,6 +328,11 @@ public class QueueManager {
     }
 
     private <T> CompletableFuture<T> submitAsync(Supplier<T> write, T failureValue) {
+        return submitAsync(write, failureValue, () -> {});
+    }
+
+    /** onSaturated runs on the caller thread when the bounded writer rejects the write. */
+    private <T> CompletableFuture<T> submitAsync(Supplier<T> write, T failureValue, Runnable onSaturated) {
         CompletableFuture<T> result = new CompletableFuture<>();
         Runnable task = () -> {
             try {
@@ -335,6 +350,7 @@ public class QueueManager {
             } else {
                 plugin.getLogger().severe("Queue writer is saturated (" + WRITER_CAPACITY
                         + " pending writes); rejecting write");
+                onSaturated.run();
                 result.complete(failureValue);
             }
         }
@@ -579,9 +595,25 @@ public class QueueManager {
 
     private void emitPersistenceFailure(String purchaseId, UUID playerUuid, String deliveryKind,
                                         Map<String, Object> details) {
+        emitQueueFailure(purchaseId, playerUuid, deliveryKind, "queue_persistence_failed", details);
+    }
+
+    private void emitWriterSaturated(String purchaseId, String playerUuid, String deliveryKind,
+                                     Map<String, Object> details) {
+        UUID playerId;
+        try {
+            playerId = playerUuid == null ? null : UUID.fromString(playerUuid);
+        } catch (IllegalArgumentException invalid) {
+            playerId = null;
+        }
+        emitQueueFailure(purchaseId, playerId, deliveryKind, "queue_writer_saturated", details);
+    }
+
+    private void emitQueueFailure(String purchaseId, UUID playerUuid, String deliveryKind, String reason,
+                                  Map<String, Object> details) {
         Map<String, Object> metadata = new LinkedHashMap<>(details);
         metadata.put("delivery_kind", deliveryKind);
-        metadata.put("reason", "queue_persistence_failed");
+        metadata.put("reason", reason);
         metadata.put("state", "queue_failed");
         auditEmitter.emit("failed", AuditOutcome.FAILED, AuditRisk.HIGH, purchaseId, playerUuid, metadata);
     }
