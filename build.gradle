@@ -45,6 +45,10 @@ shadowJar {
     relocate 'dev.ua.ikeepcalm.mysterria.audit', 'net.mysterria.delivery.libs.audit'
 }
 
+jar {
+    enabled = false
+}
+
 tasks {
     runServer {
         // Configure the Minecraft version for our task.
