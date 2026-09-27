@@ -935,19 +935,37 @@ public class DeliveryManager {
         });
     }
 
+    /**
+     * Purchases are dropped from the queue once retries are exhausted; vote rewards stay queued
+     * so later joins keep retrying them. The exhaustion row is emitted once, when the limit is hit.
+     */
     private void recordQueuedRetry(QueuedDelivery queued, UUID playerId, String deliveryKind) {
         queued.setRetryCount(queued.getRetryCount() + 1);
+        boolean retainOnExhaustion = "vote_reward".equals(deliveryKind);
         if (queued.getRetryCount() >= config.getMaxRetries()) {
             plugin.getLogger().severe("Failed to deliver " + deliveryKind + " after " + config.getMaxRetries()
                     + " retries: " + queued.getPurchaseId());
-            removeQueued(queued.getPurchaseId(), playerId, deliveryKind);
-            return;
+            if (queued.getRetryCount() == config.getMaxRetries()) {
+                emitRetriesExhausted(queued, playerId, deliveryKind, retainOnExhaustion);
+            }
+            if (!retainOnExhaustion) {
+                removeQueued(queued.getPurchaseId(), playerId, deliveryKind);
+                return;
+            }
         }
         queueManager.saveQueueAsync().thenAccept(saved -> {
             if (!saved) {
                 emitRetryPersistenceFailed(queued.getPurchaseId(), playerId, deliveryKind);
             }
         });
+    }
+
+    private void emitRetriesExhausted(QueuedDelivery queued, UUID playerId, String deliveryKind, boolean retained) {
+        auditEmitter.emit("retries-exhausted", AuditOutcome.FAILED, AuditRisk.HIGH, queued.getPurchaseId(), playerId,
+                Map.of("delivery_kind", deliveryKind,
+                        "reason", "max_retries_reached",
+                        "retry_count", queued.getRetryCount(),
+                        "state", retained ? "retained_in_queue" : "removed_from_queue"));
     }
 
     private void emitRetryPersistenceFailed(String purchaseId, UUID playerId, String deliveryKind) {
