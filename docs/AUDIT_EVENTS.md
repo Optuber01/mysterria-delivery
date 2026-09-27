@@ -26,8 +26,11 @@ through `completed-queue.blocked` until an operator reconciles the quarantined f
 the marker.
 
 Online completion writes run on a bounded background worker before the response is
-acknowledged. Partial command execution also retains a tombstone to prevent automatic
-replay. A failed or rejected completion write returns a reconciliation error and keeps
+acknowledged. Any attempted command dispatch that does not fully succeed (a rejected or
+throwing command, even the first) retains a PARTIAL tombstone to prevent automatic replay;
+all commands of an item purchase are still dispatched, with `attempted_count` and
+`dispatched_count` on the `failed` row. Player lookups, command rendering and dispatch run on
+the server thread; queue and tombstone writes run on bounded background writers. A failed or rejected completion write returns a reconciliation error and keeps
 the purchase blocked in memory. This is not an atomic transaction with Minecraft commands
 or LuckPerms: a process crash after effects but before the tombstone is saved can still
 require manual reconciliation. The `delivered` event describes effects, not tombstone durability.

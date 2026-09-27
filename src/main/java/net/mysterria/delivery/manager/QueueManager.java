@@ -40,6 +40,7 @@ import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
+import java.util.function.Supplier;
 import java.util.logging.Level;
 
 public class QueueManager {
@@ -150,6 +151,16 @@ public class QueueManager {
 
         plugin.getLogger().fine("Queued delivery for offline player: " + request.getPlayer());
         return QueueResult.QUEUED;
+    }
+
+    /** Queues a purchase on the writer thread so the disk write never runs on the server thread. */
+    public CompletableFuture<QueueResult> queueDeliveryAsync(PurchaseRequest request) {
+        return submitAsync(() -> queueDelivery(request), QueueResult.PERSISTENCE_FAILED);
+    }
+
+    /** Queues a vote reward on the writer thread so the disk write never runs on the server thread. */
+    public CompletableFuture<QueueResult> queueDeliveryAsync(VoteReward request) {
+        return submitAsync(() -> queueDelivery(request), QueueResult.PERSISTENCE_FAILED);
     }
 
     public QueueResult queueDelivery(PurchaseRequest request) {
@@ -303,13 +314,17 @@ public class QueueManager {
 
     /** Runs a queue/tombstone write on the single FIFO writer thread; each write still takes persistenceLock. */
     private CompletableFuture<Boolean> writeAsync(BooleanSupplier write) {
-        CompletableFuture<Boolean> result = new CompletableFuture<>();
+        return submitAsync(write::getAsBoolean, false);
+    }
+
+    private <T> CompletableFuture<T> submitAsync(Supplier<T> write, T failureValue) {
+        CompletableFuture<T> result = new CompletableFuture<>();
         Runnable task = () -> {
             try {
-                result.complete(write.getAsBoolean());
+                result.complete(write.get());
             } catch (RuntimeException failure) {
                 plugin.getLogger().log(Level.SEVERE, "Queue write failed", failure);
-                result.complete(false);
+                result.complete(failureValue);
             }
         };
         try {
@@ -320,7 +335,7 @@ public class QueueManager {
             } else {
                 plugin.getLogger().severe("Queue writer is saturated (" + WRITER_CAPACITY
                         + " pending writes); rejecting write");
-                result.complete(false);
+                result.complete(failureValue);
             }
         }
         return result;
