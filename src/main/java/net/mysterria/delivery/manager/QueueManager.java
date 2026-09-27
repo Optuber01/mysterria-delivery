@@ -290,6 +290,11 @@ public class QueueManager {
         });
     }
 
+    /** Returns the queued entry for this purchase, or null when it is not queued. */
+    public QueuedDelivery getQueued(String purchaseId) {
+        return isValidPurchaseId(purchaseId) ? queue.get(purchaseId) : null;
+    }
+
     public List<QueuedDelivery> getPlayerQueue(UUID playerUuid) {
         return queue.values().stream()
                 .filter(q -> q.getPlayerUuid().equals(playerUuid))

@@ -89,6 +89,7 @@ public class DeliveryManager {
             return CompletableFuture.completedFuture(completedResponse(request.getPurchaseId()));
         }
         if (queueManager.recordRepostIfQueued(request.getPurchaseId())) {
+            deliverQueuedIfOnline(request.getPurchaseId());
             return CompletableFuture.completedFuture(
                     queueResponse(request.getPurchaseId(), QueueManager.QueueResult.ALREADY_QUEUED));
         }
@@ -126,8 +127,9 @@ public class DeliveryManager {
         if (rejectIfAlreadyProcessed(request.getPurchaseId(), playerUuid, "purchase")) {
             return CompletableFuture.completedFuture(completedResponse(request.getPurchaseId()));
         }
-        // An online re-post of a queued purchase must not deliver it a second time.
+        // A re-post of a queued purchase delivers the queued entry (if online), never a second copy.
         if (queueManager.recordRepostIfQueued(request.getPurchaseId())) {
+            deliverQueuedIfOnline(request.getPurchaseId());
             return CompletableFuture.completedFuture(
                     queueResponse(request.getPurchaseId(), QueueManager.QueueResult.ALREADY_QUEUED));
         }
@@ -710,7 +712,28 @@ public class DeliveryManager {
         }
     }
 
-    /** Main thread only: called from the join listener's scheduled task. */
+    /**
+     * An online re-post of a queued purchase delivers the queued entry now, through the same
+     * claim-guarded path as a join, instead of waiting for the next join. The entry is then
+     * tombstoned and dequeued, so neither this re-post nor a later join delivers it twice.
+     */
+    private void deliverQueuedIfOnline(String purchaseId) {
+        QueuedDelivery queued = queueManager.getQueued(purchaseId);
+        if (queued == null) {
+            return;
+        }
+        runOnMain(() -> {
+            try {
+                processQueuedDelivery(queued);
+            } catch (RuntimeException failure) {
+                plugin.getLogger().log(Level.SEVERE, "Failed to deliver re-posted queued purchase " + purchaseId,
+                        failure);
+            }
+        }, failure -> plugin.getLogger().log(Level.SEVERE,
+                "Failed to schedule re-posted queued purchase " + purchaseId, failure));
+    }
+
+    /** Main thread only: called from the join listener's scheduled task and for online re-posts. */
     public void processQueuedDelivery(QueuedDelivery queued) {
         if (queued == null || !isValidPurchaseId(queued.getPurchaseId())) {
             plugin.getLogger().warning("Skipped a queued delivery without a valid purchase ID");
