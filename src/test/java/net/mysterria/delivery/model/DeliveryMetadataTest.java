@@ -42,4 +42,9 @@ class DeliveryMetadataTest {
         assertEquals(List.of("fixture.valid"), result);
         assertThrows(IllegalArgumentException.class, () -> DeliveryMetadata.strings(Map.of("commands", " "), "commands"));
     }
+    @Test void missingMetadataIsTreatedAsEmpty() {
+        assertEquals(Duration.ofDays(30), DeliveryMetadata.duration(request(null, null), clock));
+        assertEquals(Duration.ofSeconds(20), DeliveryMetadata.duration(request("2026-09-10T00:00:20", null), clock));
+        assertEquals(List.of(), DeliveryMetadata.strings(null, "permissions"));
+    }
 }

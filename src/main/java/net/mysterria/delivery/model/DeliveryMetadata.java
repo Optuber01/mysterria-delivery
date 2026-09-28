@@ -11,7 +11,7 @@ public final class DeliveryMetadata {
     private DeliveryMetadata() {}
 
     public static List<String> strings(Map<String, Object> metadata, String key) {
-        Object value = metadata.get(key);
+        Object value = metadata == null ? null : metadata.get(key);
         if (value == null) return List.of();
         List<?> values = value instanceof List<?> list ? list : List.of(value);
         if (values.stream().anyMatch(entry -> !(entry instanceof String text) || text.isBlank())) {
@@ -29,7 +29,8 @@ public final class DeliveryMetadata {
                 throw new IllegalArgumentException("Invalid entitlement expiry");
             }
         } else {
-            Object days = request.getMetadata().get("duration");
+            Map<String, Object> metadata = request.getMetadata();
+            Object days = metadata == null ? null : metadata.get("duration");
             try {
                 duration = Duration.ofDays(days == null ? 30 : Long.parseLong(days.toString()));
             } catch (RuntimeException invalid) {

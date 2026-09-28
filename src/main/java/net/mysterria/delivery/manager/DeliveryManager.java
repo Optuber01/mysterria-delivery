@@ -861,7 +861,7 @@ public class DeliveryManager {
     }
 
     private String extractGroupName(Map<String, Object> metadata) {
-        Object group = metadata.get("group");
+        Object group = metadata == null ? null : metadata.get("group");
         if (group == null) return null;
         if (!(group instanceof String name) || name.isBlank()) {
             throw new IllegalArgumentException("group must be a non-blank string");
@@ -957,6 +957,11 @@ public class DeliveryManager {
             emitInvalidRequest(request.getPurchaseId(), "invalid_player_uuid", purchaseKind(request),
                     DeliveryAuditDetails.of(request));
             return DeliveryResponse.error(request.getPurchaseId(), "A valid Minecraft UUID is required");
+        }
+        if (request.getQuantity() != null && request.getQuantity() < 1) {
+            emitInvalidRequest(request.getPurchaseId(), "invalid_quantity", purchaseKind(request),
+                    DeliveryAuditDetails.of(request));
+            return DeliveryResponse.error(request.getPurchaseId(), "Quantity must be at least 1");
         }
         return null;
     }
