@@ -490,12 +490,16 @@ public class QueueManager {
             plugin.getLogger().fine("Loaded " + completedQueuePurchases.size() + " completed queue tombstones");
         } catch (IOException | RuntimeException failure) {
             plugin.getLogger().log(Level.SEVERE, "Failed to load completed queue tombstones", failure);
-            quarantine(completedQueueFile, "malformed completed queue");
             completedQueuePersistenceBlocked = true;
             replayGuardAvailable = false;
-            writeAtomically(completedQueueBlockedFile,
+            // Marker first: a crash or failed write must never leave neither marker nor tombstone file.
+            if (writeAtomically(completedQueueBlockedFile,
                     Map.of("reason", "completed queue tombstones require manual reconciliation"),
-                    "completed queue block marker");
+                    "completed queue block marker")) {
+                quarantine(completedQueueFile, "malformed completed queue");
+            } else {
+                plugin.getLogger().severe("Left the malformed completed queue file in place because the block marker could not be written");
+            }
         }
     }
 
