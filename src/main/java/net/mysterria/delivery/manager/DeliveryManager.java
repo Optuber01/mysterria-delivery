@@ -4,6 +4,8 @@ import dev.ua.ikeepcalm.mysterria.audit.client.api.AuditOutcome;
 import dev.ua.ikeepcalm.mysterria.audit.client.api.AuditRisk;
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.minimessage.MiniMessage;
+import net.luckperms.api.model.data.DataMutateResult;
+import net.luckperms.api.model.data.TemporaryNodeMergeStrategy;
 import net.luckperms.api.node.Node;
 import net.luckperms.api.node.types.InheritanceNode;
 import net.luckperms.api.node.types.PermissionNode;
@@ -25,6 +27,7 @@ import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -46,6 +49,11 @@ public class DeliveryManager {
     private DeliveryConfig config;
     private final DeliveryAuditEmitter auditEmitter;
     private final ThreadPoolExecutor completionWriter;
+    /** Purchases whose completion tombstone is accepted by the writer but not yet written. */
+    private final Set<String> pendingCompletionWrites = ConcurrentHashMap.newKeySet();
+    /** A renewal of a still-active temporary grant extends it instead of silently doing nothing. */
+    private static final TemporaryNodeMergeStrategy RENEWAL_MERGE =
+            TemporaryNodeMergeStrategy.ADD_NEW_DURATION_TO_EXISTING;
     private static final String RECONCILIATION_REQUIRED =
             "Delivery effects occurred but replay protection could not be saved; reconciliation required";
 
@@ -444,7 +452,11 @@ public class DeliveryManager {
                 Node node = InheritanceNode.builder(groupName)
                         .expiry(duration)
                         .build();
-                user.data().add(node);
+                DataMutateResult added = user.data().add(node, RENEWAL_MERGE).getResult();
+                if (!added.wasSuccessful()) {
+                    // Nothing changed (e.g. a permanent grant already exists): fail, never report success.
+                    throw new IllegalStateException("group " + groupName + " was not added: " + added);
+                }
             });
         } catch (RuntimeException failure) {
             releasePurchase(request.getPurchaseId());
@@ -493,13 +505,21 @@ public class DeliveryManager {
                     "Permission delivery failed: " + failure.getMessage()));
         }
 
+        List<String> notAdded = new CopyOnWriteArrayList<>();
         CompletableFuture<Void> mutation;
         try {
             List<Node> nodes = permissions.stream().map(permission -> (Node) PermissionNode.builder(permission)
                     .value(true).expiry(duration).build()).toList();
             mutation = plugin.getLuckPerms().getUserManager().modifyUser(playerUuid, user -> {
+                notAdded.clear();
                 for (Node node : nodes) {
-                    user.data().add(node);
+                    if (!user.data().add(node, RENEWAL_MERGE).getResult().wasSuccessful()) {
+                        notAdded.add(node.getKey());
+                    }
+                }
+                if (notAdded.size() == nodes.size()) {
+                    // Nothing changed: fail and stay retryable, never report success.
+                    throw new IllegalStateException("no permissions were added: " + notAdded);
                 }
             });
         } catch (RuntimeException failure) {
@@ -520,6 +540,14 @@ public class DeliveryManager {
             }
 
             completePurchase(request.getPurchaseId());
+            if (!notAdded.isEmpty()) {
+                // Some nodes were saved: tombstone as partial, never retry or announce.
+                Map<String, Object> metadata = new LinkedHashMap<>(details);
+                metadata.put("not_added_permissions", String.join(",", notAdded));
+                emitFailed(request.getPurchaseId(), playerUuid, "partial_permission_delivery", "permission", metadata);
+                return DeliveryResponse.error(request.getPurchaseId(),
+                        "Permission delivery partially failed; not added: " + String.join(", ", notAdded));
+            }
             plugin.getLogger().fine("Granted permissions " + permissions + " to " + playerUuid + " for " + duration);
 
             schedulePurchaseAnnouncement(playerUuid, request);
@@ -542,6 +570,7 @@ public class DeliveryManager {
             }
             boolean partial = !response.isSuccess();
             CompletableFuture<DeliveryResponse> persisted = new CompletableFuture<>();
+            pendingCompletionWrites.add(purchaseId);
             try {
                 completionWriter.execute(() -> {
                     try {
@@ -553,9 +582,12 @@ public class DeliveryManager {
                         if (failure instanceof Error error) {
                             throw error;
                         }
+                    } finally {
+                        pendingCompletionWrites.remove(purchaseId);
                     }
                 });
             } catch (RejectedExecutionException failure) {
+                pendingCompletionWrites.remove(purchaseId);
                 persisted.complete(completionFailure(purchaseId, playerId, kind, partial, details));
             }
             return persisted;
@@ -617,9 +649,19 @@ public class DeliveryManager {
         return DeliveryResponse.error(purchaseId, RECONCILIATION_REQUIRED);
     }
 
+    /** Plugin shutdown only: drains accepted completion writes so their tombstones are not lost. */
     public void close() {
-        // Drain accepted writes off-thread; never wait for disk from the server thread.
         completionWriter.shutdown();
+        try {
+            if (!completionWriter.awaitTermination(5, TimeUnit.SECONDS)) {
+                plugin.getLogger().severe("Timed out waiting for completion writes; reconcile purchases "
+                        + pendingCompletionWrites);
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            plugin.getLogger().severe("Interrupted waiting for completion writes; reconcile purchases "
+                    + pendingCompletionWrites);
+        }
     }
 
     private void announceVoteDelivery(Recipient recipient, VoteReward request) {
