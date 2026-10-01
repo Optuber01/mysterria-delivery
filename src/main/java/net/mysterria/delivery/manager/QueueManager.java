@@ -453,6 +453,70 @@ public class QueueManager {
         }
     }
 
+    /** Saves a LEGACY (uncertain) tombstone before delivery effects run; false if it was not saved. */
+    CompletableFuture<Boolean> recordIntentAsync(String purchaseId) {
+        return writeAsync(() -> replaceCompletion(purchaseId, null, CompletionHistory.State.LEGACY));
+    }
+
+    /** Replaces a delivery's own LEGACY intent with its actual result. */
+    boolean resolveIntent(String purchaseId, boolean partial) {
+        return replaceCompletion(purchaseId, CompletionHistory.State.LEGACY,
+                partial ? CompletionHistory.State.PARTIAL : CompletionHistory.State.DELIVERED);
+    }
+
+    /**
+     * Saves the known result of a delivery whose earlier upgrade failed: its LEGACY intent (or a missing
+     * entry) is replaced, and true is returned only once that result is saved. Any other state is left alone.
+     */
+    CompletableFuture<Boolean> recoverOutcomeAsync(String purchaseId, boolean partial) {
+        CompletionHistory.State outcome = partial ? CompletionHistory.State.PARTIAL : CompletionHistory.State.DELIVERED;
+        return writeAsync(() -> {
+            synchronized (persistenceLock) {
+                CompletionHistory.State current = completedQueuePurchases.get(purchaseId);
+                if (current == outcome) {
+                    return replayGuardAvailable;
+                }
+                if (current != null && current != CompletionHistory.State.LEGACY) {
+                    return false;
+                }
+                return replaceCompletion(purchaseId, current, outcome);
+            }
+        });
+    }
+
+    /** Removes the LEGACY intent of a delivery that provably had no effect; on failure it stays blocked. */
+    CompletableFuture<Boolean> clearIntentAsync(String purchaseId) {
+        return writeAsync(() -> replaceCompletion(purchaseId, CompletionHistory.State.LEGACY, null));
+    }
+
+    /** Moves one tombstone from {@code expected} to {@code next} (null = absent), rolling memory back if the write fails. */
+    private boolean replaceCompletion(String purchaseId, CompletionHistory.State expected,
+            CompletionHistory.State next) {
+        if (!isValidPurchaseId(purchaseId)) {
+            return false;
+        }
+        synchronized (persistenceLock) {
+            if (!replayGuardAvailable || completedQueuePersistenceBlocked
+                    || completedQueuePurchases.get(purchaseId) != expected) {
+                return false;
+            }
+            setCompletion(purchaseId, next);
+            if (writeAtomically(completedQueueFile, completedQueuePurchases, "completed queue")) {
+                return true;
+            }
+            setCompletion(purchaseId, expected);
+            return false;
+        }
+    }
+
+    private void setCompletion(String purchaseId, CompletionHistory.State state) {
+        if (state == null) {
+            completedQueuePurchases.remove(purchaseId);
+        } else {
+            completedQueuePurchases.put(purchaseId, state);
+        }
+    }
+
     private void loadPendingQueueLocked() {
         if (!queueFile.exists()) {
             return;

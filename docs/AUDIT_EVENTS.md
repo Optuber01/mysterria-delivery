@@ -30,10 +30,22 @@ acknowledged. Any attempted command dispatch that does not fully succeed (a reje
 throwing command, even the first) retains a PARTIAL tombstone to prevent automatic replay;
 all commands of an item purchase are still dispatched, with `attempted_count` and
 `dispatched_count` on the `failed` row. Player lookups, command rendering and dispatch run on
-the server thread; queue and tombstone writes run on bounded background writers. A failed or rejected completion write returns a reconciliation error and keeps
-the purchase blocked in memory. This is not an atomic transaction with Minecraft commands
-or LuckPerms: a process crash after effects but before the tombstone is saved can still
-require manual reconciliation. The `delivered` event describes effects, not tombstone durability.
+the server thread; queue and tombstone writes run on bounded background writers.
+
+Before any online command or LuckPerms change runs, the claimed purchase is saved to
+`completed-queue.json` as a `LEGACY` intent. If that save fails, nothing runs and the purchase
+stays retryable. Once the outcome is known, the intent is replaced with `DELIVERED` or `PARTIAL`.
+An outcome that proves nothing ran (player offline, rejected vote command, or every LuckPerms
+add refused) removes the intent so the purchase stays retryable; if that removal cannot be saved
+it stays `LEGACY`. A failure whose effects are unknown, such as an unexpected LuckPerms or
+callback failure, keeps the `LEGACY` intent. A failed or rejected completion write returns a reconciliation error
+and leaves the saved `LEGACY` intent in place. For a queued delivery, a later queue pass before
+restart saves the known `DELIVERED` or `PARTIAL` result over that intent before it drops the queue
+entry; if that save fails, the entry stays queued and replay-blocked. After a restart, a leftover intent blocks replay
+like any other `LEGACY` entry until an operator reconciles it. This is not an atomic transaction
+with Minecraft commands or LuckPerms: a crash after the intent is saved, before or after effects,
+leaves `LEGACY` rather than the real result, so it still requires manual reconciliation. The
+`delivered` event describes effects, not tombstone durability.
 
 | Event | Meaning | Metadata |
 | --- | --- | --- |
