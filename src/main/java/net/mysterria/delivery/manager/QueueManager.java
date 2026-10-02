@@ -110,7 +110,12 @@ public class QueueManager {
         this.receivedFile = new File(plugin.getDataFolder(), "received-purchases.json");
     }
 
-    public QueueResult queueDelivery(VoteReward request) {
+    public void queueDelivery(VoteReward request) {
+        queueDeliveryChecked(request);
+    }
+
+    /** Queues a vote reward and reports whether it was durably queued. */
+    public QueueResult queueDeliveryChecked(VoteReward request) {
         UUID playerUuid = UUID.fromString(request.getMinecraftUUID());
 
         QueuedDelivery queued = QueuedDelivery.builder()
@@ -158,7 +163,7 @@ public class QueueManager {
      * A saturated writer rejects the purchase with its own purchase.failed row.
      */
     public CompletableFuture<QueueResult> queueDeliveryAsync(PurchaseRequest request) {
-        return submitAsync(() -> queueDelivery(request), QueueResult.PERSISTENCE_FAILED,
+        return submitAsync(() -> queueDeliveryChecked(request), QueueResult.PERSISTENCE_FAILED,
                 () -> emitWriterSaturated(request.getPurchaseId(), request.getMinecraftUuid(), "purchase",
                         DeliveryAuditDetails.of(request)));
     }
@@ -168,12 +173,17 @@ public class QueueManager {
      * A saturated writer rejects the vote with its own purchase.failed row.
      */
     public CompletableFuture<QueueResult> queueDeliveryAsync(VoteReward request) {
-        return submitAsync(() -> queueDelivery(request), QueueResult.PERSISTENCE_FAILED,
+        return submitAsync(() -> queueDeliveryChecked(request), QueueResult.PERSISTENCE_FAILED,
                 () -> emitWriterSaturated(request.getPurchaseId(), request.getMinecraftUUID(), "vote_reward",
                         DeliveryAuditDetails.of(request)));
     }
 
-    public QueueResult queueDelivery(PurchaseRequest request) {
+    public void queueDelivery(PurchaseRequest request) {
+        queueDeliveryChecked(request);
+    }
+
+    /** Queues a purchase and reports whether it was durably queued. */
+    public QueueResult queueDeliveryChecked(PurchaseRequest request) {
         UUID playerUuid = UUID.fromString(request.getMinecraftUuid());
 
         QueuedDelivery queued = QueuedDelivery.builder()
@@ -301,7 +311,12 @@ public class QueueManager {
                 .toList();
     }
 
-    public boolean removeFromQueue(String purchaseId) {
+    public void removeFromQueue(String purchaseId) {
+        removeFromQueueChecked(purchaseId);
+    }
+
+    /** Removes a queued entry; false when the queue file could not be saved and the entry was kept. */
+    public boolean removeFromQueueChecked(String purchaseId) {
         synchronized (persistenceLock) {
             QueuedDelivery removed = queue.remove(purchaseId);
             if (removed == null) {
@@ -316,7 +331,7 @@ public class QueueManager {
     }
 
     public CompletableFuture<Boolean> removeFromQueueAsync(String purchaseId) {
-        return writeAsync(() -> removeFromQueue(purchaseId));
+        return writeAsync(() -> removeFromQueueChecked(purchaseId));
     }
 
     public CompletableFuture<Boolean> markCompletedAsync(String purchaseId, boolean partial) {
@@ -324,7 +339,7 @@ public class QueueManager {
     }
 
     public CompletableFuture<Boolean> saveQueueAsync() {
-        return writeAsync(this::saveQueue);
+        return writeAsync(this::saveQueueChecked);
     }
 
     /** Runs a queue/tombstone write on the single FIFO writer thread; each write still takes persistenceLock. */
@@ -374,7 +389,12 @@ public class QueueManager {
         }
     }
 
-    public boolean saveQueue() {
+    public void saveQueue() {
+        saveQueueChecked();
+    }
+
+    /** Saves the queue file; false when it could not be written. */
+    public boolean saveQueueChecked() {
         synchronized (persistenceLock) {
             return saveQueueLocked();
         }
