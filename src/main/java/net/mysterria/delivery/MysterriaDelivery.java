@@ -44,6 +44,7 @@ public class MysterriaDelivery extends JavaPlugin {
         translationManager = new TranslationManager(this);
         queueManager = new QueueManager(this);
         deliveryManager = new DeliveryManager(this, deliveryConfig, queueManager);
+        queueManager.loadQueue();
 
         getCommand("delivery").setExecutor(new DeliveryCommand(this));
 
@@ -61,13 +62,18 @@ public class MysterriaDelivery extends JavaPlugin {
         webserverService.registerHandlers(new PermissionDeliveryEndpoint(deliveryManager));
         webserverService.registerHandlers(new VoteRewardDeliveryEndpoint(deliveryManager));
 
-        queueManager.loadQueue();
-
         getLogger().info("MysterriaDelivery has been enabled!");
     }
 
     @Override
     public void onDisable() {
+        // Drain queue writes first: their callbacks can still hand completion writes to the delivery manager.
+        if (queueManager != null) {
+            queueManager.close();
+        }
+        if (deliveryManager != null) {
+            deliveryManager.close();
+        }
         if (queueManager != null) {
             queueManager.saveQueue();
         }
