@@ -476,7 +476,7 @@ public class DeliveryManager {
                 () -> runItemCommands(recipient, request, commands, result));
     }
 
-    /** Main thread only, after the intent is saved. Every rendered command is dispatched, matching the pre-audit behaviour. */
+    /** Main thread only, after the intent is saved. Every rendered command is dispatched, matching the original behaviour. */
     private void runItemCommands(Recipient recipient, PurchaseRequest request, List<String> commands,
             CompletableFuture<DeliveryResponse> result) {
         String purchaseId = request.getPurchaseId();
