@@ -6,7 +6,11 @@ import com.google.gson.TypeAdapter;
 import com.google.gson.reflect.TypeToken;
 import com.google.gson.stream.JsonReader;
 import com.google.gson.stream.JsonWriter;
+import dev.ua.ikeepcalm.mysterria.audit.client.api.AuditOutcome;
+import dev.ua.ikeepcalm.mysterria.audit.client.api.AuditRisk;
 import net.mysterria.delivery.MysterriaDelivery;
+import net.mysterria.delivery.audit.DeliveryAuditDetails;
+import net.mysterria.delivery.audit.DeliveryAuditEmitter;
 import net.mysterria.delivery.model.PurchaseRequest;
 import net.mysterria.delivery.model.QueuedDelivery;
 import net.mysterria.delivery.model.VoteReward;
@@ -22,6 +26,9 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -31,6 +38,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
 import java.util.logging.Level;
@@ -73,9 +81,14 @@ public class QueueManager {
     private final File queueFile;
     private final File completedQueueFile;
     private final File completedQueueBlockedFile;
+    private final DeliveryAuditEmitter auditEmitter;
     private volatile Map<String, CompletionHistory.State> completedQueuePurchases = new ConcurrentHashMap<>();
     private boolean queuePersistenceBlocked;
     private volatile boolean replayGuardAvailable = true;
+    /** Bounded, insertion-ordered set of purchase IDs whose receipt has already been audited. */
+    static final int RECEIVED_ID_LIMIT = 10_000;
+    private final File receivedFile;
+    private final LinkedHashSet<String> receivedPurchaseIds = new LinkedHashSet<>();
     /** Upper bound on pending queue/tombstone writes; a full writer rejects new writes with a false result. */
     static final int WRITER_CAPACITY = 1024;
     private final ThreadPoolExecutor queueWriter = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS,
@@ -84,12 +97,16 @@ public class QueueManager {
                 thread.setDaemon(true);
                 return thread;
             });
+    /** At most one received-ID rewrite is pending; later receipts are folded into that rewrite. */
+    private final AtomicBoolean receivedWritePending = new AtomicBoolean();
 
     public QueueManager(MysterriaDelivery plugin) {
         this.plugin = plugin;
+        this.auditEmitter = plugin.getAuditEmitter();
         this.queueFile = new File(plugin.getDataFolder(), "queue.json");
         this.completedQueueFile = new File(plugin.getDataFolder(), "completed-queue.json");
         this.completedQueueBlockedFile = new File(plugin.getDataFolder(), "completed-queue.blocked");
+        this.receivedFile = new File(plugin.getDataFolder(), "received-purchases.json");
     }
 
     public void queueDelivery(VoteReward request) {
@@ -110,20 +127,32 @@ public class QueueManager {
                 .build();
 
         QueueResult result = enqueue(request.getPurchaseId(), queued);
+        auditEnqueue(result, request.getPurchaseId(), playerUuid, "vote_reward", DeliveryAuditDetails.of(request),
+                Map.of("delivery_kind", "vote_reward", "state", "queued"));
         if (result == QueueResult.QUEUED) {
-            plugin.getLogger().info("Queued delivery for offline player: " + request.getPlayer());
+            plugin.getLogger().fine("Queued delivery for offline player: " + request.getPlayer());
         }
         return result;
     }
 
-    /** Queues a purchase on the writer thread so the disk write never runs on the server thread. */
+    /**
+     * Queues a purchase on the writer thread so the disk write never runs on the server thread.
+     * A saturated writer rejects the purchase with its own purchase.failed row.
+     */
     public CompletableFuture<QueueResult> queueDeliveryAsync(PurchaseRequest request) {
-        return submitAsync(() -> queueDeliveryChecked(request), QueueResult.PERSISTENCE_FAILED);
+        return submitAsync(() -> queueDeliveryChecked(request), QueueResult.PERSISTENCE_FAILED,
+                () -> emitWriterSaturated(request.getPurchaseId(), request.getMinecraftUuid(), "purchase",
+                        DeliveryAuditDetails.of(request)));
     }
 
-    /** Queues a vote reward on the writer thread so the disk write never runs on the server thread. */
+    /**
+     * Queues a vote reward on the writer thread so the disk write never runs on the server thread.
+     * A saturated writer rejects the vote with its own purchase.failed row.
+     */
     public CompletableFuture<QueueResult> queueDeliveryAsync(VoteReward request) {
-        return submitAsync(() -> queueDeliveryChecked(request), QueueResult.PERSISTENCE_FAILED);
+        return submitAsync(() -> queueDeliveryChecked(request), QueueResult.PERSISTENCE_FAILED,
+                () -> emitWriterSaturated(request.getPurchaseId(), request.getMinecraftUUID(), "vote_reward",
+                        DeliveryAuditDetails.of(request)));
     }
 
     public void queueDelivery(PurchaseRequest request) {
@@ -144,10 +173,28 @@ public class QueueManager {
                 .build();
 
         QueueResult result = enqueue(request.getPurchaseId(), queued);
+        auditEnqueue(result, request.getPurchaseId(), playerUuid, "purchase", DeliveryAuditDetails.of(request),
+                Map.of("delivery_kind", "purchase", "service_name",
+                        request.getServiceName() == null ? "" : request.getServiceName(),
+                        "state", "queued"));
         if (result == QueueResult.QUEUED) {
-            plugin.getLogger().info("Queued delivery for offline player: " + request.getNickname());
+            plugin.getLogger().fine("Queued delivery for offline player: " + request.getNickname());
         }
         return result;
+    }
+
+    /** Emits the row for a queue outcome; a re-post of an already queued purchase is silent. */
+    private void auditEnqueue(QueueResult result, String purchaseId, UUID playerUuid, String deliveryKind,
+                              Map<String, Object> details, Map<String, Object> queuedFacts) {
+        switch (result) {
+            case QUEUED -> auditEmitter.emit("queued", AuditOutcome.COMMITTED, AuditRisk.NORMAL,
+                    purchaseId, playerUuid, queuedFacts);
+            case ALREADY_COMPLETED -> auditEmitter.emit("duplicate-rejected", AuditOutcome.DENIED, AuditRisk.NORMAL,
+                    purchaseId, playerUuid, Map.of("delivery_kind", deliveryKind, "state", "replay_blocked"));
+            case PERSISTENCE_FAILED -> emitQueueFailure(purchaseId, playerUuid, deliveryKind,
+                    "queue_persistence_failed", details);
+            case ALREADY_QUEUED -> { }
+        }
     }
 
     /**
@@ -162,7 +209,9 @@ public class QueueManager {
             if (completedQueuePurchases.containsKey(purchaseId)) {
                 return QueueResult.ALREADY_COMPLETED;
             }
-            if (queue.putIfAbsent(purchaseId, queued) != null) {
+            QueuedDelivery existing = queue.putIfAbsent(purchaseId, queued);
+            if (existing != null) {
+                recordRepost(existing);
                 return QueueResult.ALREADY_QUEUED;
             }
             if (!saveQueueLocked()) {
@@ -171,6 +220,57 @@ public class QueueManager {
             }
             return QueueResult.QUEUED;
         }
+    }
+
+    /**
+     * Re-posts of a queued purchase are silent: only an in-memory counter on the queue entry is
+     * bumped, and it is persisted with the next queue save.
+     */
+    public void recordRepost(QueuedDelivery queued) {
+        queued.setRepostCount(queued.getRepostCount() + 1);
+    }
+
+    /**
+     * Records that a purchase receipt is being audited. Returns false when this purchase ID
+     * was already seen, so callers emit purchase.received at most once per ID. A queued
+     * purchase counts as seen even if it has aged out of the bounded seen-set, which is
+     * persisted next to the queue file.
+     */
+    public boolean markReceived(String purchaseId) {
+        if (!isValidPurchaseId(purchaseId)) {
+            return false;
+        }
+        synchronized (persistenceLock) {
+            if (queue.containsKey(purchaseId) || !receivedPurchaseIds.add(purchaseId)) {
+                return false;
+            }
+            while (receivedPurchaseIds.size() > RECEIVED_ID_LIMIT) {
+                receivedPurchaseIds.remove(receivedPurchaseIds.iterator().next());
+            }
+        }
+        scheduleReceivedWrite();
+        return true;
+    }
+
+    /**
+     * Coalesces received-ID rewrites: only one is ever queued, and it snapshots the set when it runs,
+     * so a burst of receipts costs one file rewrite. If the writer is saturated the rewrite is dropped
+     * (audit de-duplication only) and the next receipt schedules it again.
+     */
+    private void scheduleReceivedWrite() {
+        if (!receivedWritePending.compareAndSet(false, true)) {
+            return;
+        }
+        writeAsync(() -> {
+            receivedWritePending.set(false);
+            synchronized (persistenceLock) {
+                return writeAtomically(receivedFile, new ArrayList<>(receivedPurchaseIds), "received purchase IDs");
+            }
+        }).thenAccept(written -> {
+            if (!written) {
+                receivedWritePending.set(false);
+            }
+        });
     }
 
     /** Returns the queued entry for this purchase, or null when it is not queued. */
@@ -221,6 +321,11 @@ public class QueueManager {
     }
 
     private <T> CompletableFuture<T> submitAsync(Supplier<T> write, T failureValue) {
+        return submitAsync(write, failureValue, () -> {});
+    }
+
+    /** onSaturated runs on the caller thread when the bounded writer rejects the write. */
+    private <T> CompletableFuture<T> submitAsync(Supplier<T> write, T failureValue, Runnable onSaturated) {
         CompletableFuture<T> result = new CompletableFuture<>();
         Runnable task = () -> {
             try {
@@ -238,6 +343,7 @@ public class QueueManager {
             } else {
                 plugin.getLogger().severe("Queue writer is saturated (" + WRITER_CAPACITY
                         + " pending writes); rejecting write");
+                onSaturated.run();
                 result.complete(failureValue);
             }
         }
@@ -279,6 +385,26 @@ public class QueueManager {
         synchronized (persistenceLock) {
             loadPendingQueueLocked();
             loadCompletedQueueLocked();
+            loadReceivedLocked();
+            // Queued purchases were received before they were queued; never re-audit their receipt.
+            receivedPurchaseIds.addAll(queue.keySet());
+        }
+    }
+
+    private void loadReceivedLocked() {
+        receivedPurchaseIds.clear();
+        if (!receivedFile.exists()) {
+            return;
+        }
+        try (Reader reader = Files.newBufferedReader(receivedFile.toPath(), StandardCharsets.UTF_8)) {
+            List<String> loaded = gson.fromJson(reader, new TypeToken<List<String>>() {
+            }.getType());
+            if (loaded != null) {
+                loaded.stream().filter(this::isValidPurchaseId).forEach(receivedPurchaseIds::add);
+            }
+        } catch (IOException | RuntimeException failure) {
+            // Audit de-duplication only; never blocks deliveries.
+            plugin.getLogger().log(Level.WARNING, "Failed to load received purchase IDs", failure);
         }
     }
 
@@ -380,7 +506,7 @@ public class QueueManager {
             Map<String, QueuedDelivery> candidate = validateQueue(loaded);
             queue = candidate;
             queuePersistenceBlocked = false;
-            plugin.getLogger().info("Loaded " + queue.size() + " queued deliveries");
+            plugin.getLogger().fine("Loaded " + queue.size() + " queued deliveries");
         } catch (IOException | RuntimeException failure) {
             plugin.getLogger().log(Level.SEVERE, "Failed to load queue", failure);
             queuePersistenceBlocked = !quarantine(queueFile, "malformed queue");
@@ -400,6 +526,7 @@ public class QueueManager {
         try (Reader reader = Files.newBufferedReader(completedQueueFile.toPath(), StandardCharsets.UTF_8)) {
             completedQueuePurchases = new ConcurrentHashMap<>(CompletionHistory.read(reader));
             replayGuardAvailable = true;
+            plugin.getLogger().fine("Loaded " + completedQueuePurchases.size() + " completed queue tombstones");
         } catch (IOException | RuntimeException failure) {
             plugin.getLogger().log(Level.SEVERE, "Failed to load completed queue tombstones", failure);
             replayGuardAvailable = false;
@@ -500,5 +627,19 @@ public class QueueManager {
 
     private boolean isValidPurchaseId(String purchaseId) {
         return purchaseId != null && !purchaseId.isBlank();
+    }
+
+    private void emitWriterSaturated(String purchaseId, String playerUuid, String deliveryKind,
+                                     Map<String, Object> details) {
+        emitQueueFailure(purchaseId, parseUuid(playerUuid), deliveryKind, "queue_writer_saturated", details);
+    }
+
+    private void emitQueueFailure(String purchaseId, UUID playerUuid, String deliveryKind, String reason,
+                                  Map<String, Object> details) {
+        Map<String, Object> metadata = new LinkedHashMap<>(details);
+        metadata.put("delivery_kind", deliveryKind);
+        metadata.put("reason", reason);
+        metadata.put("state", "queue_failed");
+        auditEmitter.emit("failed", AuditOutcome.FAILED, AuditRisk.HIGH, purchaseId, playerUuid, metadata);
     }
 }

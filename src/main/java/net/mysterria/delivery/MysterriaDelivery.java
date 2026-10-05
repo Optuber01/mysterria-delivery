@@ -4,6 +4,7 @@ import dev.ua.ikeepcalm.catwalk.hub.webserver.services.CatWalkWebserverService;
 import lombok.Getter;
 import net.luckperms.api.LuckPerms;
 import net.mysterria.delivery.api.*;
+import net.mysterria.delivery.audit.DeliveryAuditEmitter;
 import net.mysterria.delivery.command.DeliveryCommand;
 import net.mysterria.delivery.config.DeliveryConfig;
 import net.mysterria.delivery.listener.PlayerJoinListener;
@@ -25,6 +26,7 @@ public class MysterriaDelivery extends JavaPlugin {
     private QueueManager queueManager;
     private TranslationManager translationManager;
     private LuckPerms luckPerms;
+    private DeliveryAuditEmitter auditEmitter;
 
     @Override
     public void onEnable() {
@@ -42,6 +44,7 @@ public class MysterriaDelivery extends JavaPlugin {
 
         deliveryConfig = new DeliveryConfig(this);
         translationManager = new TranslationManager(this);
+        auditEmitter = new DeliveryAuditEmitter(this);
         queueManager = new QueueManager(this);
         deliveryManager = new DeliveryManager(this, deliveryConfig, queueManager);
         queueManager.loadQueue();
@@ -67,7 +70,8 @@ public class MysterriaDelivery extends JavaPlugin {
 
     @Override
     public void onDisable() {
-        // Queue writes drain first: their callbacks can still hand completion writes to the delivery manager.
+        // Queue writes drain first: their callbacks can still hand completion writes to the delivery manager
+        // and emit audit rows, so the emitter must still be open.
         if (queueManager != null) {
             queueManager.close();
         }
@@ -76,6 +80,9 @@ public class MysterriaDelivery extends JavaPlugin {
         }
         if (queueManager != null) {
             queueManager.saveQueue();
+        }
+        if (auditEmitter != null) {
+            auditEmitter.close();
         }
         getLogger().info("MysterriaDelivery has been disabled!");
     }
