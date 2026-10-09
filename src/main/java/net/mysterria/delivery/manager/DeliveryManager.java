@@ -2,34 +2,33 @@ package net.mysterria.delivery.manager;
 
 import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.minimessage.MiniMessage;
-import net.luckperms.api.model.data.DataMutateResult;
 import net.luckperms.api.model.data.TemporaryNodeMergeStrategy;
 import net.luckperms.api.node.Node;
 import net.luckperms.api.node.types.InheritanceNode;
 import net.luckperms.api.node.types.PermissionNode;
 import net.mysterria.delivery.MysterriaDelivery;
 import net.mysterria.delivery.config.DeliveryConfig;
-import net.mysterria.delivery.model.DeliveryResponse;
 import net.mysterria.delivery.model.DeliveryMetadata;
+import net.mysterria.delivery.model.DeliveryResponse;
 import net.mysterria.delivery.model.PurchaseRequest;
 import net.mysterria.delivery.model.QueuedDelivery;
 import net.mysterria.delivery.model.VoteReward;
 import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
 
-import java.time.Duration;
 import java.time.Clock;
+import java.time.Duration;
 import java.util.*;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
-import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.logging.Level;
 
@@ -39,18 +38,13 @@ public class DeliveryManager {
     private final QueueManager queueManager;
     private final Set<String> processedPurchases = ConcurrentHashMap.newKeySet();
     private final Set<String> inFlightPurchases = ConcurrentHashMap.newKeySet();
-    /** Purchases whose effects ran but whose completion tombstone could not be saved; value = partial. */
+    /** Purchases whose effects ran but whose completion could not be saved; value = partial. */
     private final Map<String, Boolean> replayBlockedPurchases = new ConcurrentHashMap<>();
-    /** Claimed purchases whose LEGACY intent tombstone is this delivery's own, not a finished one. */
+    /** Claimed purchases whose LEGACY tombstone is their own saved intent, not a finished delivery. */
     private final Set<String> deliveryIntents = ConcurrentHashMap.newKeySet();
     private final MiniMessage miniMessage = MiniMessage.miniMessage();
     private DeliveryConfig config;
     private final ThreadPoolExecutor completionWriter;
-    /** Purchases whose completion tombstone is accepted by the writer but not yet written. */
-    private final Set<String> pendingCompletionWrites = ConcurrentHashMap.newKeySet();
-    /** A renewal of a still-active temporary grant extends it instead of silently doing nothing. */
-    private static final TemporaryNodeMergeStrategy RENEWAL_MERGE =
-            TemporaryNodeMergeStrategy.ADD_NEW_DURATION_TO_EXISTING;
     private static final String RECONCILIATION_REQUIRED =
             "Delivery effects occurred but replay protection could not be saved; reconciliation required";
 
@@ -63,7 +57,7 @@ public class DeliveryManager {
                     Thread thread = new Thread(task, "mysterria-delivery-completions");
                     thread.setDaemon(true);
                     return thread;
-                }, new ThreadPoolExecutor.AbortPolicy());
+                });
     }
 
     public void reload(DeliveryConfig newConfig) {
@@ -71,33 +65,16 @@ public class DeliveryManager {
     }
 
     public CompletableFuture<DeliveryResponse> processPurchase(VoteReward request) {
-        if (request == null || !isValidPurchaseId(request.getPurchaseId())) {
-            return CompletableFuture.completedFuture(
-                    DeliveryResponse.error(request == null ? null : request.getPurchaseId(),
-                            "A non-blank purchase ID is required"));
+        DeliveryResponse rejected = request == null ? validate(null, null)
+                : validate(request.getPurchaseId(), request.getMinecraftUUID());
+        if (rejected == null) {
+            rejected = rejectRepost(request.getPurchaseId());
         }
-        UUID playerUuid = safeUuid(request.getMinecraftUUID());
-        if (playerUuid == null) {
-            return CompletableFuture.completedFuture(
-                    DeliveryResponse.error(request.getPurchaseId(), "A valid Minecraft UUID is required"));
+        if (rejected != null) {
+            return CompletableFuture.completedFuture(rejected);
         }
-        // A completed or replay-blocked purchase must never be acknowledged as merely queued.
-        if (rejectIfAlreadyProcessed(request.getPurchaseId())) {
-            return CompletableFuture.completedFuture(completedResponse(request.getPurchaseId()));
-        }
-        if (queueManager.isQueued(request.getPurchaseId())) {
-            deliverQueuedIfOnline(request.getPurchaseId());
-            return CompletableFuture.completedFuture(
-                    queueResponse(request.getPurchaseId(), QueueManager.QueueResult.ALREADY_QUEUED));
-        }
-        ClaimResult claim = claimPurchase(request.getPurchaseId());
-        if (claim != ClaimResult.CLAIMED) {
-            return CompletableFuture.completedFuture(
-                    duplicateResponse(request.getPurchaseId(), claim)
-            );
-        }
-        return deliverOrQueue(playerUuid, request.getPurchaseId(),
-                recipient -> result -> dispatchVoteReward(recipient, request, result),
+        return deliverOrQueue(UUID.fromString(request.getMinecraftUUID()), request.getPurchaseId(),
+                (player, result) -> dispatchVoteReward(player, request, result),
                 () -> queueManager.queueDeliveryAsync(request));
     }
 
@@ -106,30 +83,15 @@ public class DeliveryManager {
      * Requires player to be online, queues if offline
      */
     public CompletableFuture<DeliveryResponse> processItemDelivery(PurchaseRequest request) {
-        DeliveryResponse validationFailure = validatePurchaseRequest(request);
-        if (validationFailure != null) {
-            return CompletableFuture.completedFuture(validationFailure);
+        DeliveryResponse rejected = validatePurchaseRequest(request);
+        if (rejected == null) {
+            rejected = rejectRepost(request.getPurchaseId());
         }
-        UUID playerUuid = UUID.fromString(request.getMinecraftUuid());
-        // A completed or replay-blocked purchase must never be acknowledged as merely queued.
-        if (rejectIfAlreadyProcessed(request.getPurchaseId())) {
-            return CompletableFuture.completedFuture(completedResponse(request.getPurchaseId()));
+        if (rejected != null) {
+            return CompletableFuture.completedFuture(rejected);
         }
-        // A re-post of a queued purchase delivers the queued entry (if online), never a second copy.
-        if (queueManager.isQueued(request.getPurchaseId())) {
-            deliverQueuedIfOnline(request.getPurchaseId());
-            return CompletableFuture.completedFuture(
-                    queueResponse(request.getPurchaseId(), QueueManager.QueueResult.ALREADY_QUEUED));
-        }
-        ClaimResult claim = claimPurchase(request.getPurchaseId());
-        if (claim != ClaimResult.CLAIMED) {
-            return CompletableFuture.completedFuture(
-                    duplicateResponse(request.getPurchaseId(), claim)
-            );
-        }
-
-        return deliverOrQueue(playerUuid, request.getPurchaseId(),
-                recipient -> result -> dispatchItem(recipient, request, result),
+        return deliverOrQueue(UUID.fromString(request.getMinecraftUuid()), request.getPurchaseId(),
+                (player, result) -> dispatchItem(player, request, result),
                 () -> queueManager.queueDeliveryAsync(request));
     }
 
@@ -137,51 +99,28 @@ public class DeliveryManager {
      * Process subscription delivery (LuckPerms groups)
      */
     public CompletableFuture<DeliveryResponse> processSubscriptionDelivery(PurchaseRequest request) {
-        DeliveryResponse validationFailure = validatePurchaseRequest(request);
-        if (validationFailure != null) {
-            return CompletableFuture.completedFuture(validationFailure);
+        DeliveryResponse rejected = validatePurchaseRequest(request);
+        if (rejected == null) {
+            rejected = claimFailure(request.getPurchaseId());
         }
-        ClaimResult claim = claimPurchase(request.getPurchaseId());
-        if (claim != ClaimResult.CLAIMED) {
-            return CompletableFuture.completedFuture(
-                    duplicateResponse(request.getPurchaseId(), claim)
-            );
+        if (rejected != null) {
+            return CompletableFuture.completedFuture(rejected);
         }
-
-        UUID playerUuid = UUID.fromString(request.getMinecraftUuid());
-        return deliverSubscription(playerUuid, request);
+        return deliverSubscription(UUID.fromString(request.getMinecraftUuid()), request);
     }
 
     /**
      * Process permission delivery (LuckPerms permissions)
      */
     public CompletableFuture<DeliveryResponse> processPermissionDelivery(PurchaseRequest request) {
-        DeliveryResponse validationFailure = validatePurchaseRequest(request);
-        if (validationFailure != null) {
-            return CompletableFuture.completedFuture(validationFailure);
+        DeliveryResponse rejected = validatePurchaseRequest(request);
+        if (rejected == null) {
+            rejected = claimFailure(request.getPurchaseId());
         }
-        ClaimResult claim = claimPurchase(request.getPurchaseId());
-        if (claim != ClaimResult.CLAIMED) {
-            return CompletableFuture.completedFuture(
-                    duplicateResponse(request.getPurchaseId(), claim)
-            );
+        if (rejected != null) {
+            return CompletableFuture.completedFuture(rejected);
         }
-
-        UUID playerUuid = UUID.fromString(request.getMinecraftUuid());
-        return deliverPermission(playerUuid, request);
-    }
-
-    /** Plain player values captured on the main thread; safe to read from any callback thread. */
-    private record Recipient(UUID id, String name) {
-        static Recipient of(Player player) {
-            return new Recipient(player.getUniqueId(), player.getName());
-        }
-    }
-
-    /** Runs on the main thread with the captured recipient and completes the delivery result. */
-    @FunctionalInterface
-    private interface Dispatch {
-        void run(CompletableFuture<DeliveryResponse> result);
+        return deliverPermission(UUID.fromString(request.getMinecraftUuid()), request);
     }
 
     /**
@@ -189,7 +128,7 @@ public class DeliveryManager {
      * purchase on the queue writer. The claim is held until the queue write has finished.
      */
     private CompletableFuture<DeliveryResponse> deliverOrQueue(UUID playerUuid, String purchaseId,
-            Function<Recipient, Dispatch> dispatch,
+            BiConsumer<Player, CompletableFuture<DeliveryResponse>> dispatch,
             Supplier<CompletableFuture<QueueManager.QueueResult>> enqueue) {
         CompletableFuture<DeliveryResponse> result = new CompletableFuture<>();
         runOnMain(() -> {
@@ -198,12 +137,24 @@ public class DeliveryManager {
                 if (player == null || !player.isOnline()) {
                     queueOffline(purchaseId, enqueue, result);
                 } else {
-                    dispatch.apply(Recipient.of(player)).run(result);
+                    dispatch.accept(player, result);
                 }
             } catch (RuntimeException failure) {
                 preDispatchFailure(purchaseId, failure, result);
             }
         }, failure -> preDispatchFailure(purchaseId, failure, result));
+        return persistCompletion(result, purchaseId);
+    }
+
+    /** Main thread only: delivers to a player known to be online. */
+    private CompletableFuture<DeliveryResponse> deliverNow(Player player, String purchaseId,
+            BiConsumer<Player, CompletableFuture<DeliveryResponse>> dispatch) {
+        CompletableFuture<DeliveryResponse> result = new CompletableFuture<>();
+        try {
+            dispatch.accept(player, result);
+        } catch (RuntimeException failure) {
+            preDispatchFailure(purchaseId, failure, result);
+        }
         return persistCompletion(result, purchaseId);
     }
 
@@ -267,8 +218,8 @@ public class DeliveryManager {
      */
     private void afterIntent(String purchaseId, CompletableFuture<DeliveryResponse> result, Runnable effects) {
         deliveryIntents.add(purchaseId);
-        queueManager.recordIntentAsync(purchaseId).whenComplete((saved, failure) -> {
-            if (failure != null || !Boolean.TRUE.equals(saved)) {
+        queueManager.recordIntentAsync(purchaseId).thenAccept(saved -> {
+            if (!saved) {
                 deliveryIntents.remove(purchaseId);
                 releasePurchase(purchaseId);
                 result.complete(DeliveryResponse.error(purchaseId, "Delivery intent could not be persisted"));
@@ -276,32 +227,26 @@ public class DeliveryManager {
             }
             try {
                 effects.run();
-            } catch (RuntimeException effectFailure) {
-                plugin.getLogger().log(Level.SEVERE, "Delivery task failed for " + purchaseId, effectFailure);
-                if (!result.isDone()) {
-                    result.complete(keepIntent(purchaseId));
-                }
+            } catch (RuntimeException failure) {
+                effectsFailed(purchaseId, failure, result);
             }
         });
     }
 
-    /** Main thread commands, run once the intent is saved and only while the recipient is still online. */
-    private void dispatchAfterIntent(Recipient recipient, String purchaseId,
-            CompletableFuture<DeliveryResponse> result, Runnable commands) {
+    /** Main thread commands, run once the intent is saved and only while the player is still online. */
+    private void dispatchAfterIntent(UUID playerUuid, String purchaseId, CompletableFuture<DeliveryResponse> result,
+            Consumer<Player> commands) {
         afterIntent(purchaseId, result, () -> runOnMain(() -> {
             try {
-                Player player = Bukkit.getPlayer(recipient.id());
+                Player player = Bukkit.getPlayer(playerUuid);
                 if (player == null || !player.isOnline()) {
                     refuseAfterIntent(purchaseId,
                             DeliveryResponse.error(purchaseId, "Player went offline before delivery"), result);
                     return;
                 }
-                commands.run();
+                commands.accept(player);
             } catch (RuntimeException failure) {
-                plugin.getLogger().log(Level.SEVERE, "Delivery task failed for " + purchaseId, failure);
-                if (!result.isDone()) {
-                    result.complete(keepIntent(purchaseId));
-                }
+                effectsFailed(purchaseId, failure, result);
             }
         }, failure -> {
             plugin.getLogger().log(Level.SEVERE, "Failed to run delivery " + purchaseId, failure);
@@ -316,10 +261,10 @@ public class DeliveryManager {
      */
     private void refuseAfterIntent(String purchaseId, DeliveryResponse refusal,
             CompletableFuture<DeliveryResponse> result) {
-        queueManager.clearIntentAsync(purchaseId).whenComplete((cleared, failure) -> {
+        queueManager.clearIntentAsync(purchaseId).thenAccept(cleared -> {
             deliveryIntents.remove(purchaseId);
             releasePurchase(purchaseId);
-            if (failure == null && Boolean.TRUE.equals(cleared)) {
+            if (cleared) {
                 result.complete(refusal);
                 return;
             }
@@ -336,16 +281,15 @@ public class DeliveryManager {
         return CompletionHistory.response(purchaseId, CompletionHistory.State.LEGACY);
     }
 
-    private CompletableFuture<DeliveryResponse> deliverVoteReward(Recipient recipient, VoteReward request) {
-        CompletableFuture<DeliveryResponse> result = new CompletableFuture<>();
-        runOnMain(() -> dispatchVoteReward(recipient, request, result),
-                failure -> preDispatchFailure(request.getPurchaseId(), failure, result));
-        return persistCompletion(result, request.getPurchaseId());
+    private void effectsFailed(String purchaseId, RuntimeException failure, CompletableFuture<DeliveryResponse> result) {
+        plugin.getLogger().log(Level.SEVERE, "Delivery task failed for " + purchaseId, failure);
+        if (!result.isDone()) {
+            result.complete(keepIntent(purchaseId));
+        }
     }
 
     /** Main thread only. */
-    private void dispatchVoteReward(Recipient recipient, VoteReward request,
-            CompletableFuture<DeliveryResponse> result) {
+    private void dispatchVoteReward(Player player, VoteReward request, CompletableFuture<DeliveryResponse> result) {
         String purchaseId = request.getPurchaseId();
         String command = request.getCommand();
         if (command == null || command.isEmpty()) {
@@ -354,18 +298,16 @@ public class DeliveryManager {
             result.complete(DeliveryResponse.error(purchaseId, "No delivery commands configured"));
             return;
         }
-        dispatchAfterIntent(recipient, purchaseId, result,
-                () -> runVoteCommand(recipient, request, command, result));
+        dispatchAfterIntent(player.getUniqueId(), purchaseId, result,
+                online -> runVoteCommand(online, request, command, result));
     }
 
     /**
-     * Main thread only, after the intent is saved. Retry rule for the single vote command: a clean
-     * {@code false} return means nothing was dispatched, so the intent is cleared, the claim is
-     * released and the vote stays retryable (a queued vote is retried on a later join). A thrown
-     * command may have applied effects part-way, so it is tombstoned PARTIAL through
-     * {@link #dispatchFailed} and never retried automatically.
+     * Main thread only, after the intent is saved. A clean {@code false} return means nothing was
+     * dispatched, so the intent is cleared and the vote stays retryable. A thrown command may have
+     * applied effects part-way, so it is tombstoned PARTIAL and never retried automatically.
      */
-    private void runVoteCommand(Recipient recipient, VoteReward request, String command,
+    private void runVoteCommand(Player player, VoteReward request, String command,
             CompletableFuture<DeliveryResponse> result) {
         String purchaseId = request.getPurchaseId();
         boolean accepted;
@@ -378,28 +320,20 @@ public class DeliveryManager {
             return;
         }
         if (!accepted) {
-            // Nothing was dispatched: clear the intent and release the claim so the vote reward stays retryable.
             refuseAfterIntent(purchaseId, DeliveryResponse.error(purchaseId, "Delivery command was rejected"), result);
             return;
         }
         completePurchase(purchaseId);
         result.complete(DeliveryResponse.success(purchaseId, "Item delivered successfully"));
-        announceVoteDelivery(recipient, request);
-    }
-
-    private CompletableFuture<DeliveryResponse> deliverItem(Recipient recipient, PurchaseRequest request) {
-        CompletableFuture<DeliveryResponse> result = new CompletableFuture<>();
-        runOnMain(() -> dispatchItem(recipient, request, result),
-                failure -> preDispatchFailure(request.getPurchaseId(), failure, result));
-        return persistCompletion(result, request.getPurchaseId());
+        announceDelivery(player, request);
     }
 
     /** Main thread only. */
-    private void dispatchItem(Recipient recipient, PurchaseRequest request, CompletableFuture<DeliveryResponse> result) {
+    private void dispatchItem(Player player, PurchaseRequest request, CompletableFuture<DeliveryResponse> result) {
         String purchaseId = request.getPurchaseId();
         List<String> commands;
         try {
-            commands = renderCommands(recipient, request);
+            commands = renderCommands(player, request);
         } catch (RuntimeException failure) {
             releasePurchase(purchaseId);
             result.complete(DeliveryResponse.error(purchaseId, "Delivery failed: " + failure.getMessage()));
@@ -411,19 +345,17 @@ public class DeliveryManager {
             result.complete(DeliveryResponse.error(purchaseId, "No delivery commands configured"));
             return;
         }
-        dispatchAfterIntent(recipient, purchaseId, result,
-                () -> runItemCommands(recipient, request, commands, result));
+        dispatchAfterIntent(player.getUniqueId(), purchaseId, result,
+                online -> runItemCommands(online, request, commands, result));
     }
 
-    /** Main thread only, after the intent is saved. Every rendered command is dispatched, matching the original behaviour. */
-    private void runItemCommands(Recipient recipient, PurchaseRequest request, List<String> commands,
+    /** Main thread only, after the intent is saved. */
+    private void runItemCommands(Player player, PurchaseRequest request, List<String> commands,
             CompletableFuture<DeliveryResponse> result) {
         String purchaseId = request.getPurchaseId();
-        int attempted = 0;
         int dispatched = 0;
         try {
             for (String command : commands) {
-                attempted++;
                 plugin.getLogger().info("Executing command: " + command);
                 if (Bukkit.dispatchCommand(Bukkit.getConsoleSender(), command)) {
                     dispatched++;
@@ -434,25 +366,25 @@ public class DeliveryManager {
             dispatchFailed(purchaseId, "Delivery failed: " + failure.getMessage(), result);
             return;
         }
-        if (dispatched < attempted) {
+        if (dispatched < commands.size()) {
             dispatchFailed(purchaseId, "Delivery command was rejected", result);
             return;
         }
         completePurchase(purchaseId);
         result.complete(DeliveryResponse.success(purchaseId, "Item delivered successfully"));
-        announcePurchaseDelivery(recipient, request);
+        announceDelivery(player, request);
     }
 
-    private List<String> renderCommands(Recipient recipient, PurchaseRequest request) {
-        List<String> commands = extractCommands(request.getMetadata());
+    private List<String> renderCommands(Player player, PurchaseRequest request) {
+        List<String> commands = DeliveryMetadata.strings(request.getMetadata(), "commands");
         int quantity = request.getQuantity() != null ? request.getQuantity() : 1;
         List<String> rendered = new ArrayList<>(commands.size());
         for (String commandTemplate : commands) {
-            String command = Objects.requireNonNull(commandTemplate, "delivery command")
-                    .replace("{player}", recipient.name())
-                    .replace("{uuid}", recipient.id().toString())
+            String command = commandTemplate
+                    .replace("{player}", player.getName())
+                    .replace("{uuid}", player.getUniqueId().toString())
                     .replace("{quantity}", String.valueOf(quantity))
-                    .replace("{service_name}", Objects.toString(request.getServiceName(), ""));
+                    .replace("{service_name}", request.getServiceName());
 
             for (Map.Entry<String, Object> entry : request.getMetadata().entrySet()) {
                 command = command.replace("{" + entry.getKey() + "}", String.valueOf(entry.getValue()));
@@ -463,160 +395,78 @@ public class DeliveryManager {
     }
 
     private CompletableFuture<DeliveryResponse> deliverSubscription(UUID playerUuid, PurchaseRequest request) {
-        String groupName;
-        Duration duration;
-        Node node;
+        List<Node> nodes;
         try {
-            groupName = extractGroupName(request.getMetadata());
+            String groupName = extractGroupName(request.getMetadata());
             if (groupName == null) {
-                releasePurchase(request.getPurchaseId());
-                return CompletableFuture.completedFuture(
-                        DeliveryResponse.error(request.getPurchaseId(), "No group specified in metadata"));
+                return rejectBeforeIntent(request, "No group specified in metadata");
             }
-            duration = parseDuration(request);
-            node = InheritanceNode.builder(groupName)
-                    .expiry(duration)
-                    .build();
+            nodes = List.of(InheritanceNode.builder(groupName)
+                    .expiry(DeliveryMetadata.duration(request, Clock.systemDefaultZone()))
+                    .build());
         } catch (RuntimeException failure) {
-            releasePurchase(request.getPurchaseId());
-            return CompletableFuture.completedFuture(DeliveryResponse.error(request.getPurchaseId(),
-                    "Subscription delivery failed: " + failure.getMessage()));
+            return rejectBeforeIntent(request, "Subscription delivery failed: " + failure.getMessage());
         }
-
-        CompletableFuture<DeliveryResponse> result = new CompletableFuture<>();
-        afterIntent(request.getPurchaseId(), result,
-                () -> grantSubscription(playerUuid, request, groupName, duration, node, result));
-        return persistCompletion(result, request.getPurchaseId());
-    }
-
-    /** Runs once the intent is saved. Only a refused add proves nothing changed; other failures keep the intent. */
-    private void grantSubscription(UUID playerUuid, PurchaseRequest request, String groupName, Duration duration,
-            Node node, CompletableFuture<DeliveryResponse> result) {
-        String purchaseId = request.getPurchaseId();
-        CompletableFuture<Void> mutation;
-        try {
-            mutation = plugin.getLuckPerms().getUserManager().modifyUser(playerUuid, user -> {
-                DataMutateResult added = user.data().add(node, RENEWAL_MERGE).getResult();
-                if (!added.wasSuccessful()) {
-                    // Nothing changed (e.g. a permanent grant already exists): fail, never report success.
-                    throw new NothingAddedException("group " + groupName + " was not added: " + added);
-                }
-            });
-        } catch (RuntimeException | LinkageError failure) {
-            // The provider may have run or saved the mutation before throwing.
-            containSideEffect(purchaseId, () ->
-                    plugin.getLogger().log(Level.SEVERE, "Failed to start subscription delivery", failure));
-            if (nothingAdded(failure)) {
-                refuseAfterIntent(purchaseId, DeliveryResponse.error(purchaseId,
-                        "Subscription delivery failed: " + failureMessage(failure)), result);
-            } else {
-                result.complete(keepIntent(purchaseId));
-            }
-            return;
-        }
-
-        mutation.whenComplete((ignored, failure) -> {
-            try {
-                if (failure != null) {
-                    containSideEffect(purchaseId, () ->
-                            plugin.getLogger().log(Level.SEVERE, "Failed to deliver subscription", failure));
-                    if (nothingAdded(failure)) {
-                        refuseAfterIntent(purchaseId, DeliveryResponse.error(purchaseId,
-                                "Subscription delivery failed: " + failureMessage(failure)), result);
-                    } else {
-                        result.complete(keepIntent(purchaseId));
-                    }
-                    return;
-                }
-
-                completePurchase(purchaseId);
-                containSideEffect(purchaseId, () -> {
-                    plugin.getLogger().info("Granted subscription " + groupName + " to " + playerUuid
-                            + " for " + duration);
-                    schedulePurchaseAnnouncement(playerUuid, request);
-                });
-
-                result.complete(DeliveryResponse.success(purchaseId, "Subscription granted successfully"));
-            } catch (RuntimeException | LinkageError callbackFailure) {
-                mutationCallbackFailed(purchaseId, result, callbackFailure);
-            }
-        });
+        return grant(playerUuid, request, nodes, "Subscription", "Subscription granted successfully");
     }
 
     private CompletableFuture<DeliveryResponse> deliverPermission(UUID playerUuid, PurchaseRequest request) {
-        List<String> permissions;
-        Duration duration;
-        try {
-            permissions = extractPermissions(request.getMetadata());
-            if (permissions.isEmpty()) {
-                releasePurchase(request.getPurchaseId());
-                return CompletableFuture.completedFuture(
-                        DeliveryResponse.error(request.getPurchaseId(), "No permissions specified in metadata"));
-            }
-            duration = parseDuration(request);
-        } catch (RuntimeException failure) {
-            releasePurchase(request.getPurchaseId());
-            return CompletableFuture.completedFuture(DeliveryResponse.error(request.getPurchaseId(),
-                    "Permission delivery failed: " + failure.getMessage()));
-        }
-
         List<Node> nodes;
         try {
+            List<String> permissions = DeliveryMetadata.strings(request.getMetadata(), "permissions");
+            if (permissions.isEmpty()) {
+                return rejectBeforeIntent(request, "No permissions specified in metadata");
+            }
+            Duration duration = DeliveryMetadata.duration(request, Clock.systemDefaultZone());
             nodes = permissions.stream().map(permission -> (Node) PermissionNode.builder(permission)
                     .value(true).expiry(duration).build()).toList();
         } catch (RuntimeException failure) {
-            releasePurchase(request.getPurchaseId());
-            plugin.getLogger().log(Level.SEVERE, "Failed to start permission delivery", failure);
-            return CompletableFuture.completedFuture(DeliveryResponse.error(request.getPurchaseId(),
-                    "Permission delivery failed: " + failure.getMessage()));
+            return rejectBeforeIntent(request, "Permission delivery failed: " + failure.getMessage());
         }
-
-        CompletableFuture<DeliveryResponse> result = new CompletableFuture<>();
-        afterIntent(request.getPurchaseId(), result,
-                () -> grantPermissions(playerUuid, request, permissions, duration, nodes, result));
-        return persistCompletion(result, request.getPurchaseId());
+        return grant(playerUuid, request, nodes, "Permission", "Permissions granted successfully");
     }
 
-    /** Runs once the intent is saved. Only all adds refused proves nothing changed; other failures keep the intent. */
-    private void grantPermissions(UUID playerUuid, PurchaseRequest request, List<String> permissions,
-            Duration duration, List<Node> nodes, CompletableFuture<DeliveryResponse> result) {
-        String purchaseId = request.getPurchaseId();
-        List<String> notAdded = new CopyOnWriteArrayList<>();
-        CompletableFuture<Void> mutation;
-        try {
-            mutation = plugin.getLuckPerms().getUserManager().modifyUser(playerUuid, user -> {
-                notAdded.clear();
-                for (Node node : nodes) {
-                    if (!user.data().add(node, RENEWAL_MERGE).getResult().wasSuccessful()) {
-                        notAdded.add(node.getKey());
-                    }
-                }
-                if (notAdded.size() == nodes.size()) {
-                    // Nothing changed: fail and stay retryable, never report success.
-                    throw new NothingAddedException("no permissions were added: " + notAdded);
-                }
-            });
-        } catch (RuntimeException | LinkageError failure) {
-            // The provider may have run or saved the mutation before throwing.
-            containSideEffect(purchaseId, () ->
-                    plugin.getLogger().log(Level.SEVERE, "Failed to start permission delivery", failure));
-            if (nothingAdded(failure)) {
-                refuseAfterIntent(purchaseId, DeliveryResponse.error(purchaseId,
-                        "Permission delivery failed: " + failureMessage(failure)), result);
-            } else {
-                result.complete(keepIntent(purchaseId));
-            }
-            return;
-        }
+    private CompletableFuture<DeliveryResponse> rejectBeforeIntent(PurchaseRequest request, String message) {
+        releasePurchase(request.getPurchaseId());
+        return CompletableFuture.completedFuture(DeliveryResponse.error(request.getPurchaseId(), message));
+    }
 
-        mutation.whenComplete((ignored, failure) -> {
+    /**
+     * Adds the nodes once the intent is saved. Only all adds refused proves nothing changed, so the
+     * purchase stays retryable; any other failure keeps the intent, and some refused adds are a
+     * partial grant that is tombstoned and never retried.
+     */
+    private CompletableFuture<DeliveryResponse> grant(UUID playerUuid, PurchaseRequest request, List<Node> nodes,
+            String kind, String successMessage) {
+        String purchaseId = request.getPurchaseId();
+        CompletableFuture<DeliveryResponse> result = new CompletableFuture<>();
+        afterIntent(purchaseId, result, () -> {
+            List<String> notAdded = new CopyOnWriteArrayList<>();
+            CompletableFuture<Void> mutation;
             try {
+                mutation = plugin.getLuckPerms().getUserManager().modifyUser(playerUuid, user -> {
+                    notAdded.clear();
+                    for (Node node : nodes) {
+                        if (!user.data().add(node, TemporaryNodeMergeStrategy.ADD_NEW_DURATION_TO_EXISTING)
+                                .getResult().wasSuccessful()) {
+                            notAdded.add(node.getKey());
+                        }
+                    }
+                    if (notAdded.size() == nodes.size()) {
+                        throw new NothingAddedException("nothing was added: " + notAdded);
+                    }
+                });
+            } catch (RuntimeException failure) {
+                // The provider may have run or saved the mutation before throwing.
+                mutation = CompletableFuture.failedFuture(failure);
+            }
+
+            mutation.whenComplete((ignored, failure) -> {
                 if (failure != null) {
-                    containSideEffect(purchaseId, () ->
-                            plugin.getLogger().log(Level.SEVERE, "Failed to deliver permissions", failure));
+                    plugin.getLogger().log(Level.SEVERE, "Failed to deliver " + purchaseId, failure);
                     if (nothingAdded(failure)) {
                         refuseAfterIntent(purchaseId, DeliveryResponse.error(purchaseId,
-                                "Permission delivery failed: " + failureMessage(failure)), result);
+                                kind + " delivery failed: " + failureMessage(failure)), result);
                     } else {
                         result.complete(keepIntent(purchaseId));
                     }
@@ -625,45 +475,21 @@ public class DeliveryManager {
 
                 completePurchase(purchaseId);
                 if (!notAdded.isEmpty()) {
-                    // Some nodes were saved: tombstone as partial, never retry or announce.
-                    String notAddedList = String.join(", ", notAdded);
                     result.complete(DeliveryResponse.error(purchaseId,
-                            "Permission delivery partially failed; not added: " + notAddedList));
+                            kind + " delivery partially failed; not added: " + String.join(", ", notAdded)));
                     return;
                 }
-                containSideEffect(purchaseId, () -> {
-                    plugin.getLogger().info("Granted permissions " + permissions + " to " + playerUuid
-                            + " for " + duration);
-                    schedulePurchaseAnnouncement(playerUuid, request);
+                result.complete(DeliveryResponse.success(purchaseId, successMessage));
+                plugin.getLogger().info("Granted " + nodes.stream().map(Node::getKey).toList() + " to " + playerUuid);
+                Bukkit.getScheduler().runTask(plugin, () -> {
+                    Player player = Bukkit.getPlayer(playerUuid);
+                    if (player != null) {
+                        announceDelivery(player, request);
+                    }
                 });
-
-                result.complete(DeliveryResponse.success(purchaseId, "Permissions granted successfully"));
-            } catch (RuntimeException | LinkageError callbackFailure) {
-                mutationCallbackFailed(purchaseId, result, callbackFailure);
-            }
+            });
         });
-    }
-
-    /**
-     * An unexpected failure inside a LuckPerms callback never proves no effect: the caller is still
-     * completed with the saved LEGACY intent, and an outcome already completed is left as is.
-     */
-    private void mutationCallbackFailed(String purchaseId, CompletableFuture<DeliveryResponse> result,
-            Throwable failure) {
-        if (!result.isDone()) {
-            result.complete(keepIntent(purchaseId));
-        }
-        containSideEffect(purchaseId, () -> plugin.getLogger().log(Level.SEVERE,
-                "Delivery callback failed for " + purchaseId, failure));
-    }
-
-    /** Log and announcement side effects never change a delivery's outcome. */
-    private void containSideEffect(String purchaseId, Runnable sideEffect) {
-        try {
-            sideEffect.run();
-        } catch (RuntimeException | LinkageError failure) {
-            plugin.getLogger().log(Level.WARNING, "Delivery side effect failed for " + purchaseId, failure);
-        }
+        return persistCompletion(result, purchaseId);
     }
 
     /** Thrown inside a LuckPerms mutation when every add was refused, so the user was not changed. */
@@ -683,10 +509,25 @@ public class DeliveryManager {
         return false;
     }
 
-    /** Persist both online and queued outcomes before acknowledging them to the caller.
-     * Commands and storage cannot form an atomic transaction: the LEGACY intent saved by
-     * {@link #afterIntent} blocks replay across a crash between them, which still requires
-     * reconciliation. Partial grants are also tombstoned, never retried.
+    private CompletableFuture<DeliveryResponse> deliverDiscordRole(PurchaseRequest request) {
+        return CompletableFuture.supplyAsync(() -> {
+            plugin.getLogger().info("Discord role purchase: " + request.getServiceName() + " by " + request.getNickname());
+
+            Player player = Bukkit.getPlayer(UUID.fromString(request.getMinecraftUuid()));
+            if (player != null) {
+                Bukkit.getScheduler().runTask(plugin, () -> announceDelivery(player, request));
+            }
+
+            processedPurchases.add(request.getPurchaseId());
+
+            return DeliveryResponse.success(request.getPurchaseId(), "Discord role logged successfully");
+        });
+    }
+
+    /**
+     * Saves the outcome of a delivery that ran before acknowledging it, online or queued. Commands and
+     * storage cannot form an atomic transaction: the LEGACY intent saved by {@link #afterIntent}
+     * blocks replay across a crash between them, which still requires reconciliation.
      */
     private CompletableFuture<DeliveryResponse> persistCompletion(CompletableFuture<DeliveryResponse> delivery,
             String purchaseId) {
@@ -696,24 +537,9 @@ public class DeliveryManager {
             }
             boolean partial = !response.isSuccess();
             CompletableFuture<DeliveryResponse> persisted = new CompletableFuture<>();
-            pendingCompletionWrites.add(purchaseId);
             try {
-                completionWriter.execute(() -> {
-                    try {
-                        persisted.complete(writeCompletion(response, purchaseId));
-                    } catch (RuntimeException | Error failure) {
-                        // Never leave the caller's response hanging on an unexpected writer failure.
-                        plugin.getLogger().log(Level.SEVERE, "Completion write failed for " + purchaseId, failure);
-                        persisted.complete(completionFailure(purchaseId, partial));
-                        if (failure instanceof Error error) {
-                            throw error;
-                        }
-                    } finally {
-                        pendingCompletionWrites.remove(purchaseId);
-                    }
-                });
+                completionWriter.execute(() -> persisted.complete(writeCompletion(response, purchaseId)));
             } catch (RejectedExecutionException failure) {
-                pendingCompletionWrites.remove(purchaseId);
                 persisted.complete(completionFailure(purchaseId, partial));
             }
             return persisted;
@@ -722,14 +548,8 @@ public class DeliveryManager {
 
     private DeliveryResponse writeCompletion(DeliveryResponse response, String purchaseId) {
         boolean partial = !response.isSuccess();
-        boolean marked;
-        try {
-            // The saved LEGACY intent stays the replay block if this upgrade fails.
-            marked = queueManager.resolveIntent(purchaseId, partial);
-        } catch (RuntimeException failure) {
-            marked = false;
-        }
-        if (!marked) {
+        // The saved LEGACY intent stays the replay block if this upgrade fails.
+        if (!queueManager.resolveIntent(purchaseId, partial)) {
             return completionFailure(purchaseId, partial);
         }
         deliveryIntents.remove(purchaseId);
@@ -752,48 +572,14 @@ public class DeliveryManager {
         completionWriter.shutdown();
         try {
             if (!completionWriter.awaitTermination(5, TimeUnit.SECONDS)) {
-                plugin.getLogger().severe("Timed out waiting for completion writes; reconcile purchases "
-                        + pendingCompletionWrites);
+                plugin.getLogger().severe("Timed out waiting for completion writes; unsaved purchases stay LEGACY and need reconciliation");
             }
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
-            plugin.getLogger().severe("Interrupted waiting for completion writes; reconcile purchases "
-                    + pendingCompletionWrites);
         }
     }
 
-    private void announceVoteDelivery(Recipient recipient, VoteReward request) {
-        try {
-            announceDelivery(recipient, request);
-        } catch (RuntimeException failure) {
-            plugin.getLogger().log(Level.WARNING, "Vote reward delivered, but its announcement failed", failure);
-        }
-    }
-
-    private void announcePurchaseDelivery(Recipient recipient, PurchaseRequest request) {
-        try {
-            announceDelivery(recipient, request);
-        } catch (RuntimeException failure) {
-            plugin.getLogger().log(Level.WARNING, "Purchase delivered, but its announcement failed", failure);
-        }
-    }
-
-    private void schedulePurchaseAnnouncement(UUID playerId, PurchaseRequest request) {
-        try {
-            Bukkit.getScheduler().runTask(plugin, () -> {
-                Player player = Bukkit.getPlayer(playerId);
-                if (player != null) {
-                    announcePurchaseDelivery(Recipient.of(player), request);
-                }
-            });
-        } catch (RuntimeException failure) {
-            plugin.getLogger().log(Level.WARNING,
-                    "Purchase delivered, but its announcement could not be scheduled", failure);
-        }
-    }
-
-    /** Main thread only. */
-    private void announceDelivery(Recipient purchaser, VoteReward request) {
+    private void announceDelivery(Player purchaser, VoteReward request) {
         if (!config.isAnnouncementsEnabled()) {
             return;
         }
@@ -806,14 +592,14 @@ public class DeliveryManager {
 
             String messageKey = "announcement.vote";
             String message = tm.getMessage(langCode, messageKey)
-                    .replace("{player}", purchaser.name())
+                    .replace("{player}", purchaser.getName())
                     .replace("{amount}", request.getAmount());
 
             Component component = miniMessage.deserialize(message);
 
             if (config.isAnnouncementGlobal()) {
                 player.sendMessage(component);
-            } else if (player.getUniqueId().equals(purchaser.id())) {
+            } else if (player.equals(purchaser)) {
                 player.sendMessage(component);
             }
         }
@@ -837,8 +623,7 @@ public class DeliveryManager {
         };
     }
 
-    /** Main thread only. */
-    private void announceDelivery(Recipient purchaser, PurchaseRequest request) {
+    private void announceDelivery(Player purchaser, PurchaseRequest request) {
         if (!config.isAnnouncementsEnabled()) {
             return;
         }
@@ -852,43 +637,17 @@ public class DeliveryManager {
             String deliveryType = mapCategoryToTranslationKey(request.getServiceCategory());
             String messageKey = "announcement." + deliveryType;
             String message = tm.getMessage(langCode, messageKey)
-                    .replace("{player}", purchaser.name())
+                    .replace("{player}", purchaser.getName())
                     .replace("{service}", request.getServiceName());
 
             Component component = miniMessage.deserialize(message);
 
             if (config.isAnnouncementGlobal()) {
                 player.sendMessage(component);
-            } else if (player.getUniqueId().equals(purchaser.id())) {
+            } else if (player.equals(purchaser)) {
                 player.sendMessage(component);
             }
         }
-    }
-
-    /**
-     * An online re-post of a queued purchase delivers the queued entry now, through the same
-     * claim-guarded path as a join, instead of waiting for the next join. The entry is then
-     * tombstoned and dequeued, so neither this re-post nor a later join delivers it twice.
-     * Offline re-posts do nothing, and a retryable failure here never uses up a join retry.
-     */
-    private void deliverQueuedIfOnline(String purchaseId) {
-        QueuedDelivery queued = queueManager.getQueued(purchaseId);
-        if (queued == null) {
-            return;
-        }
-        runOnMain(() -> {
-            try {
-                Player player = Bukkit.getPlayer(queued.getPlayerUuid());
-                if (player == null || !player.isOnline()) {
-                    return;
-                }
-                processQueuedDelivery(queued, false);
-            } catch (RuntimeException failure) {
-                plugin.getLogger().log(Level.SEVERE, "Failed to deliver re-posted queued purchase " + purchaseId,
-                        failure);
-            }
-        }, failure -> plugin.getLogger().log(Level.SEVERE,
-                "Failed to schedule re-posted queued purchase " + purchaseId, failure));
     }
 
     /** Main thread only: called from the join listener's scheduled task. */
@@ -898,91 +657,99 @@ public class DeliveryManager {
 
     /** Main thread only. {@code countRetry} is false for online re-posts, which must not consume retries. */
     private void processQueuedDelivery(QueuedDelivery queued, boolean countRetry) {
-        if (queued == null || !isValidPurchaseId(queued.getPurchaseId())) {
-            plugin.getLogger().warning("Skipped a queued delivery without a valid purchase ID");
-            return;
-        }
+        String purchaseId = queued.getPurchaseId();
         if (!queueManager.isReplayGuardAvailable()) {
             plugin.getLogger().severe("Skipped queued delivery because completed-purchase replay protection is unavailable: "
-                    + queued.getPurchaseId());
+                    + purchaseId);
             return;
         }
-        // Its LEGACY intent looks completed, so save the known result before the generic cleanup can dequeue it.
-        if (replayBlockedPurchases.containsKey(queued.getPurchaseId())) {
-            persistReplayBlockedQueued(queued);
-            return;
-        }
-        if (isCompleted(queued.getPurchaseId())) {
-            queueManager.removeFromQueueAsync(queued.getPurchaseId());
+        // A replay-blocked delivery also has a LEGACY tombstone, so this must run before it is treated as completed.
+        if (replayBlockedPurchases.containsKey(purchaseId) || isCompleted(purchaseId)) {
+            persistAlreadyProcessedQueued(purchaseId);
             return;
         }
         Player player = Bukkit.getPlayer(queued.getPlayerUuid());
         if (player == null || !player.isOnline()) {
             return;
         }
-        Recipient recipient = Recipient.of(player);
-        ClaimResult claim = claimPurchase(queued.getPurchaseId());
+        ClaimResult claim = claimPurchase(purchaseId);
         if (claim == ClaimResult.ALREADY_PROCESSED) {
-            persistAlreadyProcessedQueued(queued.getPurchaseId());
+            persistAlreadyProcessedQueued(purchaseId);
             return;
         }
         if (claim != ClaimResult.CLAIMED) {
             return;
         }
 
-        if (queued.getPurchaseRequest() != null) {
-            deliverQueuedPurchase(queued, recipient, countRetry);
-        } else if (queued.getVoteReward() != null) {
-            deliverQueuedVote(queued, recipient, countRetry);
-        } else {
-            releasePurchase(queued.getPurchaseId());
-            plugin.getLogger().warning("Skipped an empty queued delivery: " + queued.getPurchaseId());
-        }
+        CompletableFuture<DeliveryResponse> delivery = queued.getPurchaseRequest() != null
+                ? deliverNow(player, purchaseId, (online, result) ->
+                        dispatchItem(online, queued.getPurchaseRequest(), result))
+                : deliverNow(player, purchaseId, (online, result) ->
+                        dispatchVoteReward(online, queued.getVoteReward(), result));
+        delivery.thenAccept(response -> handleQueuedOutcome(queued, countRetry));
     }
 
-    private void deliverQueuedPurchase(QueuedDelivery queued, Recipient recipient, boolean countRetry) {
-        PurchaseRequest request = queued.getPurchaseRequest();
-        if (!queued.getPurchaseId().equals(request.getPurchaseId())) {
-            releasePurchase(queued.getPurchaseId());
-            plugin.getLogger().severe("Skipped queued purchase with a mismatched payload ID: "
-                    + queued.getPurchaseId());
-            return;
-        }
-        deliverItem(recipient, request).thenAccept(response ->
-                handleQueuedOutcome(queued, false, response, countRetry));
+    /**
+     * An online re-post of a queued purchase delivers the queued entry now, through the same
+     * claim-guarded path as a join, so neither this re-post nor a later join delivers it twice.
+     */
+    private void deliverQueuedIfOnline(QueuedDelivery queued) {
+        runOnMain(() -> processQueuedDelivery(queued, false), failure -> plugin.getLogger().log(Level.SEVERE,
+                "Failed to schedule re-posted queued purchase " + queued.getPurchaseId(), failure));
     }
 
-    private void deliverQueuedVote(QueuedDelivery queued, Recipient recipient, boolean countRetry) {
-        VoteReward vote = queued.getVoteReward();
-        if (!queued.getPurchaseId().equals(vote.getPurchaseId())) {
-            releasePurchase(queued.getPurchaseId());
-            plugin.getLogger().severe("Skipped queued vote reward with a mismatched payload ID: "
-                    + queued.getPurchaseId());
-            return;
-        }
-        deliverVoteReward(recipient, vote).thenAccept(response ->
-                handleQueuedOutcome(queued, true, response, countRetry));
-    }
-
-    /** Runs on a completion thread: uses only captured plain values, never Bukkit objects. */
-    private void handleQueuedOutcome(QueuedDelivery queued, boolean vote, DeliveryResponse response,
-            boolean countRetry) {
+    /** Runs on a completion thread: uses only plain values, never Bukkit objects. */
+    private void handleQueuedOutcome(QueuedDelivery queued, boolean countRetry) {
         String purchaseId = queued.getPurchaseId();
-        if (response.isSuccess()) {
-            persistQueuedCompletion(purchaseId, false);
-        } else if (replayBlockedPurchases.containsKey(purchaseId)) {
-            persistReplayBlockedQueued(queued);
-        } else if (processedPurchases.contains(purchaseId)) {
+        if (processedPurchases.contains(purchaseId) || replayBlockedPurchases.containsKey(purchaseId)) {
+            persistAlreadyProcessedQueued(purchaseId);
+        } else if (countRetry) {
+            recordQueuedRetry(queued);
+        }
+    }
+
+    /**
+     * Saves the result of a queued purchase whose effects already ran, then dequeues it. A replay-blocked
+     * delivery saves its known result over its LEGACY intent; any other tombstone is kept as is.
+     */
+    private void persistAlreadyProcessedQueued(String purchaseId) {
+        Boolean blockedPartial = replayBlockedPurchases.get(purchaseId);
+        boolean partial = blockedPartial != null
+                ? blockedPartial
+                : queueManager.completionState(purchaseId) == CompletionHistory.State.PARTIAL;
+        if (partial) {
             plugin.getLogger().severe("Purchase was only partially delivered; automatic retry is disabled: "
                     + purchaseId);
-            persistQueuedCompletion(purchaseId, true);
-        } else if (countRetry) {
-            recordQueuedRetry(queued, vote);
         }
+        CompletableFuture<Boolean> tombstone = blockedPartial != null
+                ? queueManager.recoverOutcomeAsync(purchaseId, partial)
+                : queueManager.markCompletedAsync(purchaseId, partial);
+        tombstone.thenCompose(marked -> marked
+                        ? queueManager.removeFromQueueAsync(purchaseId)
+                        : CompletableFuture.completedFuture(false))
+                .thenAccept(persisted -> {
+                    if (persisted && blockedPartial != null) {
+                        replayBlockedPurchases.remove(purchaseId, blockedPartial);
+                    }
+                });
     }
 
-    private List<String> extractCommands(Map<String, Object> metadata) {
-        return DeliveryMetadata.strings(metadata, "commands");
+    /**
+     * Purchases are dropped from the queue once retries are exhausted; vote rewards stay queued
+     * so later joins keep retrying them.
+     */
+    private void recordQueuedRetry(QueuedDelivery queued) {
+        queued.setRetryCount(queued.getRetryCount() + 1);
+        boolean vote = queued.getVoteReward() != null;
+        if (queued.getRetryCount() >= config.getMaxRetries()) {
+            plugin.getLogger().severe("Failed to deliver " + (vote ? "vote reward" : "purchase") + " after "
+                    + config.getMaxRetries() + " retries: " + queued.getPurchaseId());
+            if (!vote) {
+                queueManager.removeFromQueueAsync(queued.getPurchaseId());
+                return;
+            }
+        }
+        queueManager.saveQueueAsync();
     }
 
     private String extractGroupName(Map<String, Object> metadata) {
@@ -994,37 +761,48 @@ public class DeliveryManager {
         return name;
     }
 
-    private List<String> extractPermissions(Map<String, Object> metadata) {
-        return DeliveryMetadata.strings(metadata, "permissions");
-    }
-
-    private Duration parseDuration(PurchaseRequest request) {
-        return DeliveryMetadata.duration(request, Clock.systemDefaultZone());
-    }
-
-    private DeliveryResponse validatePurchaseRequest(PurchaseRequest request) {
-        if (request == null || !isValidPurchaseId(request.getPurchaseId())) {
-            return DeliveryResponse.error(request == null ? null : request.getPurchaseId(),
-                    "A non-blank purchase ID is required");
+    private DeliveryResponse validate(String purchaseId, String minecraftUuid) {
+        if (!isValidPurchaseId(purchaseId)) {
+            return DeliveryResponse.error(purchaseId, "A non-blank purchase ID is required");
         }
-        if (safeUuid(request.getMinecraftUuid()) == null) {
-            return DeliveryResponse.error(request.getPurchaseId(), "A valid Minecraft UUID is required");
-        }
-        if (request.getQuantity() != null && request.getQuantity() < 1) {
-            return DeliveryResponse.error(request.getPurchaseId(), "Quantity must be at least 1");
+        if (safeUuid(minecraftUuid) == null) {
+            return DeliveryResponse.error(purchaseId, "A valid Minecraft UUID is required");
         }
         return null;
     }
 
-    /**
-     * Rejects a re-post whose purchase already has a completion tombstone or a replay block,
-     * before any queued-entry acknowledgement can mask the completed state.
-     */
-    private boolean rejectIfAlreadyProcessed(String purchaseId) {
-        if (!queueManager.isReplayGuardAvailable()) {
-            return false;
+    private DeliveryResponse validatePurchaseRequest(PurchaseRequest request) {
+        if (request == null) {
+            return validate(null, null);
         }
-        return replayBlockedPurchases.containsKey(purchaseId) || isCompleted(purchaseId);
+        DeliveryResponse invalid = validate(request.getPurchaseId(), request.getMinecraftUuid());
+        if (invalid == null && request.getQuantity() != null && request.getQuantity() < 1) {
+            return DeliveryResponse.error(request.getPurchaseId(), "Quantity must be at least 1");
+        }
+        return invalid;
+    }
+
+    /**
+     * Returns the response for a re-post that must not be delivered again, or null when the purchase
+     * was claimed. A completed or replay-blocked purchase is never acknowledged as merely queued.
+     */
+    private DeliveryResponse rejectRepost(String purchaseId) {
+        if (queueManager.isReplayGuardAvailable()
+                && (replayBlockedPurchases.containsKey(purchaseId) || isCompleted(purchaseId))) {
+            return completedResponse(purchaseId);
+        }
+        QueuedDelivery queued = queueManager.getQueued(purchaseId);
+        if (queued != null) {
+            deliverQueuedIfOnline(queued);
+            return queueResponse(purchaseId, QueueManager.QueueResult.ALREADY_QUEUED);
+        }
+        return claimFailure(purchaseId);
+    }
+
+    /** Claims the purchase; returns the response for a duplicate, or null when the claim succeeded. */
+    private DeliveryResponse claimFailure(String purchaseId) {
+        ClaimResult claim = claimPurchase(purchaseId);
+        return claim == ClaimResult.CLAIMED ? null : duplicateResponse(purchaseId, claim);
     }
 
     private ClaimResult claimPurchase(String purchaseId) {
@@ -1054,9 +832,7 @@ public class DeliveryManager {
     }
 
     private void releasePurchase(String purchaseId) {
-        if (purchaseId != null) {
-            inFlightPurchases.remove(purchaseId);
-        }
+        inFlightPurchases.remove(purchaseId);
     }
 
     private DeliveryResponse duplicateResponse(String purchaseId, ClaimResult claim) {
@@ -1081,83 +857,6 @@ public class DeliveryManager {
             case PERSISTENCE_FAILED -> DeliveryResponse.error(purchaseId,
                     "Delivery could not be persisted to the offline queue");
         };
-    }
-
-    /**
-     * Re-tombstones an already-processed queue entry. A replay-blocked delivery saves its known result
-     * over its LEGACY intent; any other tombstone, including an unknown LEGACY one, is kept as is.
-     */
-    private void persistAlreadyProcessedQueued(String purchaseId) {
-        Boolean blockedPartial = replayBlockedPurchases.get(purchaseId);
-        if (blockedPartial != null) {
-            persistKnownQueuedOutcome(purchaseId, blockedPartial).thenAccept(persisted -> {
-                if (persisted) {
-                    replayBlockedPurchases.remove(purchaseId, blockedPartial);
-                }
-            });
-            return;
-        }
-        boolean partial = queueManager.completionState(purchaseId) == CompletionHistory.State.PARTIAL;
-        persistQueuedCompletion(purchaseId, partial);
-    }
-
-    /**
-     * Re-tombstones a queued delivery whose effects ran but whose completion write failed.
-     * The replay-blocked flag records whether the delivery was partial; its LEGACY intent is
-     * upgraded to that result before the queue entry and flag are dropped.
-     */
-    private void persistReplayBlockedQueued(QueuedDelivery queued) {
-        String purchaseId = queued.getPurchaseId();
-        Boolean blockedPartial = replayBlockedPurchases.get(purchaseId);
-        if (blockedPartial == null) {
-            return;
-        }
-        if (blockedPartial) {
-            plugin.getLogger().severe("Purchase was only partially delivered; automatic retry is disabled: "
-                    + purchaseId);
-        }
-        persistKnownQueuedOutcome(purchaseId, blockedPartial).thenAccept(persisted -> {
-            if (persisted) {
-                replayBlockedPurchases.remove(purchaseId, blockedPartial);
-            }
-        });
-    }
-
-    /** Tombstones then dequeues a delivered queue entry; both writes run off the server thread. */
-    private CompletableFuture<Boolean> persistQueuedCompletion(String purchaseId, boolean partial) {
-        return dequeueAfterTombstone(queueManager.markCompletedAsync(purchaseId, partial), purchaseId);
-    }
-
-    /** Saves a replay-blocked delivery's known result over its LEGACY intent, then dequeues it. */
-    private CompletableFuture<Boolean> persistKnownQueuedOutcome(String purchaseId, boolean partial) {
-        return dequeueAfterTombstone(queueManager.recoverOutcomeAsync(purchaseId, partial), purchaseId);
-    }
-
-    private CompletableFuture<Boolean> dequeueAfterTombstone(CompletableFuture<Boolean> tombstone,
-            String purchaseId) {
-        return tombstone.thenCompose(marked -> {
-            if (!marked) {
-                return CompletableFuture.completedFuture(false);
-            }
-            return queueManager.removeFromQueueAsync(purchaseId);
-        });
-    }
-
-    /**
-     * Purchases are dropped from the queue once retries are exhausted; vote rewards stay queued
-     * so later joins keep retrying them.
-     */
-    private void recordQueuedRetry(QueuedDelivery queued, boolean vote) {
-        queued.setRetryCount(queued.getRetryCount() + 1);
-        if (queued.getRetryCount() >= config.getMaxRetries()) {
-            plugin.getLogger().severe("Failed to deliver " + (vote ? "vote reward" : "purchase") + " after "
-                    + config.getMaxRetries() + " retries: " + queued.getPurchaseId());
-            if (!vote) {
-                queueManager.removeFromQueueAsync(queued.getPurchaseId());
-                return;
-            }
-        }
-        queueManager.saveQueueAsync();
     }
 
     private String failureMessage(Throwable failure) {

@@ -67,7 +67,7 @@ public class MysterriaDelivery extends JavaPlugin {
 
     @Override
     public void onDisable() {
-        // Drain queue writes first: their callbacks can still hand completion writes to the delivery manager.
+        // Queue writes drain first: their callbacks can still hand completion writes to the delivery manager.
         if (queueManager != null) {
             queueManager.close();
         }
