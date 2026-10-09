@@ -538,7 +538,18 @@ public class DeliveryManager {
             boolean partial = !response.isSuccess();
             CompletableFuture<DeliveryResponse> persisted = new CompletableFuture<>();
             try {
-                completionWriter.execute(() -> persisted.complete(writeCompletion(response, purchaseId)));
+                completionWriter.execute(() -> {
+                    try {
+                        persisted.complete(writeCompletion(response, purchaseId));
+                    } catch (RuntimeException | Error failure) {
+                        // Never leave the caller's response hanging on an unexpected writer failure.
+                        plugin.getLogger().log(Level.SEVERE, "Completion write failed for " + purchaseId, failure);
+                        persisted.complete(completionFailure(purchaseId, partial));
+                        if (failure instanceof Error error) {
+                            throw error;
+                        }
+                    }
+                });
             } catch (RejectedExecutionException failure) {
                 persisted.complete(completionFailure(purchaseId, partial));
             }
@@ -657,7 +668,17 @@ public class DeliveryManager {
 
     /** Main thread only. {@code countRetry} is false for online re-posts, which must not consume retries. */
     private void processQueuedDelivery(QueuedDelivery queued, boolean countRetry) {
+        if (queued == null || !isValidPurchaseId(queued.getPurchaseId())) {
+            plugin.getLogger().warning("Skipped a queued delivery without a valid purchase ID");
+            return;
+        }
         String purchaseId = queued.getPurchaseId();
+        String payloadId = queued.getPurchaseRequest() != null ? queued.getPurchaseRequest().getPurchaseId()
+                : queued.getVoteReward() != null ? queued.getVoteReward().getPurchaseId() : null;
+        if (!purchaseId.equals(payloadId)) {
+            plugin.getLogger().severe("Skipped queued delivery with a missing or mismatched payload ID: " + purchaseId);
+            return;
+        }
         if (!queueManager.isReplayGuardAvailable()) {
             plugin.getLogger().severe("Skipped queued delivery because completed-purchase replay protection is unavailable: "
                     + purchaseId);

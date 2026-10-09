@@ -293,7 +293,13 @@ public class QueueManager {
     CompletionHistory.State completionState(String purchaseId) { return completedQueuePurchases.get(purchaseId); }
 
     public boolean markCompleted(String purchaseId, boolean partial) {
+        if (!isValidPurchaseId(purchaseId)) {
+            return false;
+        }
         synchronized (persistenceLock) {
+            if (!replayGuardAvailable) {
+                return false;
+            }
             return completedQueuePurchases.containsKey(purchaseId) || replaceCompletion(purchaseId, null,
                     partial ? CompletionHistory.State.PARTIAL : CompletionHistory.State.DELIVERED);
         }
@@ -418,6 +424,9 @@ public class QueueManager {
             if (queued == null || !isValidPurchaseId(queued.getPurchaseId()) || queued.getPlayerUuid() == null) {
                 throw new IllegalArgumentException("queue entry has no purchase ID or player UUID");
             }
+            if (queued.getRetryCount() < 0) {
+                throw new IllegalArgumentException("queue entry " + queued.getPurchaseId() + " has a negative retry count");
+            }
             PurchaseRequest purchase = queued.getPurchaseRequest();
             VoteReward vote = queued.getVoteReward();
             if ((purchase == null) == (vote == null)) {
@@ -426,7 +435,12 @@ public class QueueManager {
             if (!queued.getPurchaseId().equals(purchase == null ? vote.getPurchaseId() : purchase.getPurchaseId())) {
                 throw new IllegalArgumentException("queue entry " + queued.getPurchaseId() + " has a mismatched payload ID");
             }
-            candidate.put(queued.getPurchaseId(), queued);
+            if (!queued.getPlayerUuid().equals(parseUuid(purchase == null ? vote.getMinecraftUUID() : purchase.getMinecraftUuid()))) {
+                throw new IllegalArgumentException("queue entry " + queued.getPurchaseId() + " has a mismatched payload UUID");
+            }
+            if (candidate.putIfAbsent(queued.getPurchaseId(), queued) != null) {
+                throw new IllegalArgumentException("queue contains duplicate purchase ID " + queued.getPurchaseId());
+            }
         }
         return candidate;
     }
@@ -470,6 +484,17 @@ public class QueueManager {
             Files.move(source, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
         } catch (AtomicMoveNotSupportedException ignored) {
             Files.move(source, target, StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
+    private UUID parseUuid(String value) {
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        try {
+            return UUID.fromString(value);
+        } catch (IllegalArgumentException ignored) {
+            return null;
         }
     }
 
